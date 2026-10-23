@@ -459,6 +459,172 @@ class AdventureView(discord.ui.View):
     async def heal_button(self, interaction, button):
         await self.update_fight(interaction, "heal")
 
+
+class FieldBossView(discord.ui.View):
+    """Interactive turn-based fight for the five field bosses."""
+    def __init__(self, author, boss_key, boss):
+        super().__init__(timeout=600)
+        self.author_id = author.id
+        self.boss_key = boss_key
+        self.boss = boss.copy()
+        self.boss_hp = boss["hp"]
+        self.turns = 0
+        self.finished = False
+        self.locked = False
+
+        p = ensure_player(author.id, str(author))
+        self.gear_atk, self.gear_hp, self.gear_def = equipment_stats(author.id)
+        self.max_hp = p[9] + self.gear_hp
+        self.hp = self.max_hp
+        self.mp = p[10]
+        self.max_mp = p[10]
+        self.level = p[2]
+        self.atk = p[11] + self.gear_atk
+        self.defense = p[12] + self.gear_def
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Pertarungan ini milik pemain lain.", ephemeral=True
+            )
+            return False
+        if self.finished:
+            await interaction.response.send_message(
+                "Pertarungan sudah selesai.", ephemeral=True
+            )
+            return False
+        if self.locked:
+            await interaction.response.send_message(
+                "Aksi sebelumnya masih diproses, coba sebentar lagi.", ephemeral=True
+            )
+            return False
+        return True
+
+    def status_text(self, last_action=""):
+        return (
+            f"⚔️ **Field Boss: {self.boss['name']}** · {self.boss['difficulty']}\n"
+            f"👹 Boss HP: **{max(0, self.boss_hp):,}/{self.boss['hp']:,}** · ATK {self.boss['atk']:,}\n"
+            f"❤️ HP kamu: **{max(0, self.hp):,}/{self.max_hp:,}** · "
+            f"💧 MP: **{self.mp}/{self.max_mp}** · Giliran: **{self.turns}**\n"
+            f"{last_action}"
+        )
+
+    async def act(self, interaction, action):
+        self.locked = True
+        try:
+            await interaction.response.defer()
+            if action == "skill" and self.mp < 15:
+                await interaction.followup.send(
+                    "MP tidak cukup; skill memerlukan 15 MP.", ephemeral=True
+                )
+                return
+
+            if action == "skill":
+                self.mp -= 15
+                damage = max(1, int(
+                    self.atk * (2.0 + self.level * 0.04) - self.boss["def"] * 0.35
+                ))
+            elif action == "guard":
+                heal = max(10, self.defense * 2)
+                self.hp = min(self.max_hp, self.hp + heal)
+                damage = 0
+            else:
+                damage = max(1, int(
+                    self.atk + self.level * 2 - self.boss["def"] * 0.25
+                ))
+
+            self.boss_hp -= damage
+            self.turns += 1
+
+            if self.boss_hp <= 0:
+                self.finished = True
+                self.stop()
+                gain_exp(self.author_id, self.boss["exp"])
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE rpg_players SET gold_coin=gold_coin+?,wins=wins+1 WHERE user_id=?",
+                        (self.boss["gold"], str(self.author_id)),
+                    )
+                drop = None
+                if random.random() < self.boss["chance"]:
+                    item_data = LIMITED_EQUIPMENT[self.boss["drop"]]
+                    add_equipment(
+                        self.author_id,
+                        (self.boss["drop"], *item_data),
+                        "Any", 1, "field_boss"
+                    )
+                    drop = self.boss["drop"]
+                for child in self.children:
+                    child.disabled = True
+                result = (
+                    f"🏆 **{self.boss['name']} dikalahkan!**\n"
+                    f"Hadiah: {self.boss['exp']:,} EXP · {self.boss['gold']:,} Gold.\n"
+                    f"HP tersisa: {max(0, self.hp):,}/{self.max_hp:,} · Giliran: {self.turns}"
+                )
+                result += (
+                    f"\n🎁 Limited drop: **{drop}** — terikat ke akunmu."
+                    if drop else
+                    f"\nDrop tidak jatuh kali ini ({int(self.boss['chance'] * 100)}% peluang)."
+                )
+                await interaction.edit_original_response(content=result, view=self)
+                return
+
+            incoming = max(1, int(self.boss["atk"] - self.defense * 0.4))
+            if action == "guard":
+                incoming = max(1, incoming // 2)
+            self.hp -= incoming
+
+            if self.hp <= 0:
+                self.hp = 0
+                self.finished = True
+                self.stop()
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE rpg_players SET losses=losses+1 WHERE user_id=?",
+                        (str(self.author_id),),
+                    )
+                for child in self.children:
+                    child.disabled = True
+                await interaction.edit_original_response(
+                    content=self.status_text(
+                        f"💀 **Kamu kalah!** {self.boss['name']} masih memiliki "
+                        f"**{self.boss_hp:,} HP**. Tidak ada hadiah kemenangan."
+                    ),
+                    view=self,
+                )
+                return
+
+            await interaction.edit_original_response(
+                content=self.status_text(
+                    f"Aksi **{action}** menghasilkan **{damage} damage**. "
+                    f"Boss membalas **{incoming} damage**."
+                ),
+                view=self,
+            )
+        except Exception as exc:
+            print(f"[Fumi RPG] Field boss action error ({action}): {exc!r}")
+            try:
+                await interaction.followup.send(
+                    "Terjadi error saat memproses aksi. Admin bisa memeriksa Console FadeHost.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+        finally:
+            self.locked = False
+
+    @discord.ui.button(label="Serang", style=discord.ButtonStyle.primary, emoji="⚔️")
+    async def attack_button(self, interaction, button):
+        await self.act(interaction, "attack")
+
+    @discord.ui.button(label="Skill (15 MP)", style=discord.ButtonStyle.danger, emoji="✨")
+    async def skill_button(self, interaction, button):
+        await self.act(interaction, "skill")
+
+    @discord.ui.button(label="Bertahan/Pulih", style=discord.ButtonStyle.success, emoji="🛡️")
+    async def guard_button(self, interaction, button):
+        await self.act(interaction, "guard")
+
 class SecretBossView(discord.ui.View):
     """Turn-based solo or co-op Secret Boss battle. Rewards are granted once on victory."""
     def __init__(self, boss_key, boss, members):
@@ -937,33 +1103,19 @@ def setup_rpg(bot):
         await rpg_send(ctx,"boss",content="**👹 Field Bosses**\n"+"\n\n".join(lines)+"\n\nLawan dengan `!fieldbossfight <key>`.")
 
     @bot.command(name="fieldbossfight", aliases=["fboss"])
-    async def fieldbossfight(ctx,boss_key:str=None):
-        ensure_player(ctx.author.id,str(ctx.author))
+    async def fieldbossfight(ctx, boss_key: str = None):
+        ensure_player(ctx.author.id, str(ctx.author))
         if not boss_key or boss_key.lower() not in FIELD_BOSSES:
-            await rpg_send(ctx,"boss",content="Gunakan `!fieldbosses`, lalu `!fieldbossfight basic1` (basic2, hard1, hard2, nightmare1).")
+            await rpg_send(ctx, "boss", content="Gunakan `!fieldbosses`, lalu `!fieldbossfight basic1` (basic2, hard1, hard2, nightmare1).")
             return
-        key=boss_key.lower(); boss=FIELD_BOSSES[key]; p=ensure_player(ctx.author.id,str(ctx.author))
-        gear_atk,gear_hp,gear_def=equipment_stats(ctx.author.id)
-        max_hp=p[9]+gear_hp; hp=max_hp; boss_hp=boss["hp"]; atk=p[11]+gear_atk; defense=p[12]+gear_def; turns=0
-        while hp>0 and boss_hp>0 and turns<100:
-            turns+=1; boss_hp-=max(1,int(atk+p[2]*2-boss["def"]*0.25))
-            if boss_hp>0: hp-=max(1,int(boss["atk"]-defense*0.4))
-        if boss_hp<=0:
-            gain_exp(ctx.author.id,boss["exp"])
-            with get_connection() as conn:
-                conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+?,wins=wins+1 WHERE user_id=?",(boss["gold"],str(ctx.author.id)))
-            drop=None
-            if random.random()<boss["chance"]:
-                slot,rarity,da,dh,dd=LIMITED_EQUIPMENT[boss["drop"]]
-                add_equipment(ctx.author.id,(boss["drop"],slot,rarity,da,dh,dd),"Any",1,"field_boss")
-                drop=boss["drop"]
-            result=f"🏆 **{boss['name']} dikalahkan!**\nHadiah: {boss['exp']:,} EXP · {boss['gold']:,} Gold.\nHP tersisa: {max(0,hp):,}/{max_hp:,} · Giliran: {turns}"
-            result+=f"\n🎁 Limited drop: **{drop}** — terikat ke akunmu." if drop else f"\nDrop tidak jatuh kali ini ({int(boss['chance']*100)}% peluang)."
-        else:
-            with get_connection() as conn: conn.execute("UPDATE rpg_players SET losses=losses+1 WHERE user_id=?",(str(ctx.author.id),))
-            result=f"💀 Kalah melawan **{boss['name']}**. Boss tersisa sekitar {max(0,boss_hp):,} HP. Tingkatkan level/equipment lalu coba lagi."
-        await rpg_send(ctx,"boss",content=result)
-
+        key = boss_key.lower()
+        boss = FIELD_BOSSES[key]
+        view = FieldBossView(ctx.author, key, boss)
+        await rpg_send(
+            ctx, "boss",
+            content=view.status_text("Pilih aksi di bawah untuk memulai pertarungan."),
+            view=view
+        )
 
     @bot.command(name="bosses", aliases=["secretboss"])
     async def bosses(ctx):
