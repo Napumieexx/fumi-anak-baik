@@ -244,58 +244,90 @@ class AdventureView(discord.ui.View):
         self.hp, self.mp = self.max_hp, self.max_mp
 
     async def update_fight(self, interaction, action):
+        # Reply to Discord immediately so the interaction does not expire while
+        # SQLite or combat calculations are running.
         if self.finished:
             await interaction.response.send_message("Pertarungan sudah selesai.", ephemeral=True)
             return
-        player = ensure_player(self.author_id, str(interaction.user))
-        level, atk, defense = player[2], player[11], player[12]
         if action == "skill" and self.mp < 15:
             await interaction.response.send_message("MP tidak cukup untuk memakai skill.", ephemeral=True)
             return
-        if action == "skill":
-            self.mp -= 15
-            damage = max(1, int(atk * (2.0 + level * 0.04) - self.monster["def"] * 0.35))
-        elif action == "attack":
-            damage = max(1, int(atk + level * 2 - self.monster["def"] * 0.25))
-        else:
-            self.hp = min(self.max_hp, self.hp + max(10, defense * 2))
-            damage = 0
-        self.monster["hp"] -= damage
-        if self.monster["hp"] <= 0:
-            self.finished = True
-            reward_exp, reward_gold = self.monster["exp"], self.monster["gold"]
-            result = gain_exp(self.author_id, reward_exp)
-            with get_connection() as conn:
-                conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+?, wins=wins+1 WHERE user_id=?",
-                             (reward_gold, str(self.author_id)))
-            self.disable_all_items()
-            await interaction.response.edit_message(
-                content=f"🏆 **Menang!** {self.monster['name']} dikalahkan.\n"
-                        f"Hadiah: **{reward_exp} EXP** dan **{reward_gold} Gold Coin**.\n"
-                        f"HP tersisa: {self.hp}/{self.max_hp} · MP: {self.mp}/{self.max_mp}",
-                view=self)
-            return
-        incoming = max(1, int(self.monster["atk"] - defense * 0.4))
-        self.hp -= incoming
-        if self.hp <= 0:
-            self.finished = True
-            with get_connection() as conn:
-                conn.execute("UPDATE rpg_players SET losses=losses+1 WHERE user_id=?", (str(self.author_id),))
-            self.disable_all_items()
-            await interaction.response.edit_message(
-                content=f"💀 **Kalah!** {self.monster['name']} masih memiliki {self.monster['hp']} HP.\n"
-                        f"Gunakan `!profile` untuk melihat statistik dan coba lagi setelah level-up.",
-                view=self)
-            return
-        self.disable_all_items()
-        for item in self.children:
-            item.disabled = False
-        await interaction.response.edit_message(
-            content=f"⚔️ **Melawan {self.monster['name']}** · Kesulitan **{self.difficulty.title()}**\n"
-                    f"Monster HP: **{self.monster['hp']}** · ATK: **{self.monster['atk']}**\n"
-                    f"HP kamu: **{self.hp}/{self.max_hp}** · MP: **{self.mp}/{self.max_mp}**\n"
-                    f"Aksi terakhir: {action.title()} menghasilkan **{damage} damage**.",
-            view=self)
+
+        await interaction.response.defer()
+        try:
+            player = ensure_player(self.author_id, str(interaction.user))
+            level, atk, defense = player[2], player[11], player[12]
+
+            if action == "skill":
+                self.mp -= 15
+                damage = max(1, int(atk * (2.0 + level * 0.04) - self.monster["def"] * 0.35))
+            elif action == "attack":
+                damage = max(1, int(atk + level * 2 - self.monster["def"] * 0.25))
+            else:  # Bertahan/Pulih
+                self.hp = min(self.max_hp, self.hp + max(10, defense * 2))
+                damage = 0
+
+            self.monster["hp"] -= damage
+            if self.monster["hp"] <= 0:
+                self.finished = True
+                reward_exp, reward_gold = self.monster["exp"], self.monster["gold"]
+                gain_exp(self.author_id, reward_exp)
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE rpg_players SET gold_coin=gold_coin+?, wins=wins+1 WHERE user_id=?",
+                        (reward_gold, str(self.author_id)),
+                    )
+                self.disable_all_items()
+                await interaction.edit_original_response(
+                    content=(f"🏆 **Menang!** {self.monster['name']} dikalahkan.\n"
+                             f"Hadiah: **{reward_exp} EXP** dan **{reward_gold} Gold Coin**.\n"
+                             f"HP tersisa: {self.hp}/{self.max_hp} · MP: {self.mp}/{self.max_mp}"),
+                    view=self,
+                )
+                return
+
+            incoming = max(1, int(self.monster["atk"] - defense * 0.4))
+            # Bertahan/Pulih reduces incoming damage for this turn.
+            if action == "heal":
+                incoming = max(1, incoming // 2)
+            self.hp -= incoming
+
+            if self.hp <= 0:
+                self.finished = True
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE rpg_players SET losses=losses+1 WHERE user_id=?",
+                        (str(self.author_id),),
+                    )
+                self.disable_all_items()
+                await interaction.edit_original_response(
+                    content=(f"💀 **Kalah!** {self.monster['name']} masih memiliki {self.monster['hp']} HP.\n"
+                             "Gunakan `!profile` untuk melihat statistik dan coba lagi setelah level-up."),
+                    view=self,
+                )
+                return
+
+            for item in self.children:
+                item.disabled = False
+            await interaction.edit_original_response(
+                content=(f"⚔️ **Melawan {self.monster['name']}** · Kesulitan **{self.difficulty.title()}**\n"
+                         f"Monster HP: **{self.monster['hp']}** · ATK: **{self.monster['atk']}**\n"
+                         f"HP kamu: **{self.hp}/{self.max_hp}** · MP: **{self.mp}/{self.max_mp}**\n"
+                         f"Aksi terakhir: {action.title()} menghasilkan **{damage} damage**."
+                         + (f" Monster menyerang balik sebesar **{incoming}** damage." if action != "heal" else f" Kamu bertahan dan menerima **{incoming}** damage.")),
+                view=self,
+            )
+        except Exception as exc:
+            # Log the actual error in the hosting console and give the player
+            # a visible response instead of leaving the interaction spinning.
+            print(f"[Fumi RPG] Adventure action error ({action}): {exc!r}")
+            try:
+                await interaction.edit_original_response(
+                    content="⚠️ Terjadi error saat memproses aksi. Coba mulai ulang dengan `!adventure basic`. Admin bisa memeriksa Console FadeHost.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="Serang", style=discord.ButtonStyle.primary, emoji="⚔️")
     async def attack_button(self, interaction, button):
