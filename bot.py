@@ -10,6 +10,7 @@ import database
 from detector import detect_words
 from games import setup_games
 from quiz import setup_quiz
+from menu import setup_menu
 
 
 # =========================
@@ -38,6 +39,7 @@ bot = commands.Bot(
 # Daftarkan fitur game dan kuis pada bot yang sama
 setup_games(bot)
 setup_quiz(bot)
+setup_menu(bot)
 
 
 # =========================
