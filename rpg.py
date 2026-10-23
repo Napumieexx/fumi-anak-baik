@@ -92,7 +92,64 @@ CLASSES = {
     "Healer": {"hp": 120, "mp": 90, "atk": 17, "def": 12, "skill": "Radiant Mend"},
     "Assassin": {"hp": 100, "mp": 65, "atk": 35, "def": 8, "skill": "Shadow Strike"},
 }
+
+CLASS_EQUIPMENT = {
+ "Warrior":[("Recruit Sword","weapon","Basic",12,0,0),("Iron Guard","armor","Basic",0,90,8),("Bronze Cleaver","weapon","Basic",18,0,0),("Patrol Mail","armor","Basic",0,130,12),("Lionheart Edge","weapon","Rare",55,0,0),("Vanguard Plate","armor","Rare",0,420,35),("War Drum Axe","weapon","Rare",70,0,0),("Crimson Oath","weapon","Epic",180,0,0),("Bastion of Dawn","armor","Epic",0,1500,110),("Titanbreaker","weapon","Epic",220,0,0),("Worldsplitter","weapon","Mythic",520,0,0),("Aegis of the First King","armor","Mythic",0,5000,360)],
+ "Mage":[("Apprentice Wand","weapon","Basic",14,0,0),("Novice Robe","armor","Basic",0,65,5),("Ember Staff","weapon","Basic",20,0,0),("Runic Mantle","armor","Basic",0,100,8),("Frostweave Rod","weapon","Rare",60,0,0),("Astral Vestment","armor","Rare",0,350,25),("Stormcall Scepter","weapon","Rare",76,0,0),("Cometbinder","weapon","Epic",190,0,0),("Voidthread Robe","armor","Epic",0,1250,85),("Archon's Focus","weapon","Epic",230,0,0),("Starfall Grimoire","weapon","Mythic",550,0,0),("Mantle of the Cosmos","armor","Mythic",0,4200,300)],
+ "Archer":[("Hunting Bow","weapon","Basic",13,0,0),("Scout Leathers","armor","Basic",0,80,6),("Reed Longbow","weapon","Basic",19,0,0),("Windrunner Vest","armor","Basic",0,115,9),("Falconstring","weapon","Rare",58,0,0),("Moontrail Garb","armor","Rare",0,380,28),("Piercing Yew","weapon","Rare",74,0,0),("Tempest Bow","weapon","Epic",185,0,0),("Nightstalker Cuirass","armor","Epic",0,1350,95),("Skybreaker Recurve","weapon","Epic",225,0,0),("Worldroot Bow","weapon","Mythic",530,0,0),("Cloak of the Last Hunt","armor","Mythic",0,4400,310)],
+ "Healer":[("Pilgrim Mace","weapon","Basic",9,0,0),("Acolyte Vestments","armor","Basic",0,100,8),("Dawnwood Staff","weapon","Basic",15,0,0),("Sanctuary Cape","armor","Basic",0,140,12),("Mercy Rod","weapon","Rare",42,0,0),("Lifebloom Robe","armor","Rare",0,450,32),("Sunlit Crook","weapon","Rare",55,0,0),("Seraphic Scepter","weapon","Epic",150,0,0),("Sanctum Aegis","armor","Epic",0,1600,120),("Grace of Sol","weapon","Epic",180,0,0),("Dawn Eternal","weapon","Mythic",420,0,0),("Raiment of the First Saint","armor","Mythic",0,5200,380)],
+ "Assassin":[("Rookie Daggers","weapon","Basic",16,0,0),("Duskrunner Wraps","armor","Basic",0,70,5),("Blacksteel Knife","weapon","Basic",22,0,0),("Silentstep Vest","armor","Basic",0,105,8),("Phantom Fang","weapon","Rare",68,0,0),("Shadeweave Armor","armor","Rare",0,330,22),("Venomkiss","weapon","Rare",82,0,0),("Red Eclipse","weapon","Epic",205,0,0),("Umbral Carapace","armor","Epic",0,1200,80),("Soulpiercer","weapon","Epic",245,0,0),("Last Whisper","weapon","Mythic",580,0,0),("Mantle of the Unseen King","armor","Mythic",0,4000,280)]
+}
+EQUIPMENT_SHOP = {"Recruit Sword":180,"Iron Guard":220,"Bronze Cleaver":260,"Apprentice Wand":180,"Novice Robe":200,"Hunting Bow":190,"Scout Leathers":210,"Pilgrim Mace":160,"Acolyte Vestments":210,"Rookie Daggers":200,"Duskrunner Wraps":190}
+EQUIPMENT_GACHA_COST = 250
+EQUIPMENT_GACHA_ODDS = (("Basic",50),("Rare",27),("Epic",18),("Mythic",5))
+FIELD_BOSSES = {
+ "basic1":{"name":"Mossfang, Raja Rimba","difficulty":"Basic","hp":550,"atk":32,"def":12,"exp":100,"gold":120,"drop":"Mossfang Hide Armor","chance":0.35},
+ "basic2":{"name":"Golem Penjaga Reruntuhan","difficulty":"Basic","hp":780,"atk":38,"def":18,"exp":140,"gold":160,"drop":"Runestone Blade","chance":0.30},
+ "hard1":{"name":"Dreadfang Alpha","difficulty":"Hard","hp":2600,"atk":125,"def":45,"exp":500,"gold":500,"drop":"Dreadfang Mantle","chance":0.25},
+ "hard2":{"name":"Ironmaw, Colossus Perang","difficulty":"Hard","hp":3400,"atk":145,"def":65,"exp":650,"gold":650,"drop":"Ironmaw Greatsword","chance":0.22},
+ "nightmare1":{"name":"Abyssal Drake, Pemakan Cahaya","difficulty":"Nightmare","hp":9500,"atk":320,"def":110,"exp":1800,"gold":1800,"drop":"Abyssal Drakeplate","chance":0.12}
+}
+LIMITED_EQUIPMENT = {
+ "Mossfang Hide Armor":("armor","Limited",0,320,24),"Runestone Blade":("weapon","Limited",95,0,0),
+ "Dreadfang Mantle":("armor","Limited",0,1100,85),"Ironmaw Greatsword":("weapon","Limited",260,0,0),
+ "Abyssal Drakeplate":("armor","Limited",0,3800,260)
+}
+
 SECRET_CLASS = "The Night Ruler"
+
+# Statistik bertambah otomatis setiap level. Angka ini adalah bonus per level
+# di atas level 1; statistik dasar tetap mengikuti class yang dipilih.
+STAT_GROWTH = {"hp": 12, "mp": 5, "atk": 2, "def": 1}
+
+def stats_for_level(class_name, level):
+    base = CLASSES.get(class_name, CLASSES["Warrior"])
+    steps = max(0, int(level) - 1)
+    return {
+        "hp": base["hp"] + steps * STAT_GROWTH["hp"],
+        "mp": base["mp"] + steps * STAT_GROWTH["mp"],
+        "atk": base["atk"] + steps * STAT_GROWTH["atk"],
+        "def": base["def"] + steps * STAT_GROWTH["def"],
+    }
+
+def sync_player_stats(user_id, *, refill=True):
+    """Recalculate max stats from the saved class/level without resetting progress."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT level, class_name, hp, mp FROM rpg_players WHERE user_id=?",
+            (str(user_id),)
+        ).fetchone()
+        if not row:
+            return None
+        level, class_name, old_hp, old_mp = row
+        stats = stats_for_level(class_name, level)
+        hp = stats["hp"] if refill else min(old_hp, stats["hp"])
+        mp = stats["mp"] if refill else min(old_mp, stats["mp"])
+        conn.execute(
+            "UPDATE rpg_players SET hp=?, mp=?, atk=?, defense=? WHERE user_id=?",
+            (hp, mp, stats["atk"], stats["def"], str(user_id))
+        )
+    return stats
 
 def get_connection():
     return sqlite3.connect(RPG_DATABASE_FILE, timeout=10)
@@ -158,6 +215,21 @@ def setup_rpg_database():
                 PRIMARY KEY(user_id, item_key)
             )
         """)
+
+        conn.execute("""CREATE TABLE IF NOT EXISTS rpg_equipment_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, item_name TEXT NOT NULL,
+            slot TEXT NOT NULL, rarity TEXT NOT NULL, atk_bonus INTEGER NOT NULL DEFAULT 0,
+            hp_bonus INTEGER NOT NULL DEFAULT 0, def_bonus INTEGER NOT NULL DEFAULT 0,
+            class_name TEXT NOT NULL DEFAULT 'Any', bound INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'gacha', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS rpg_equipment_loadout (
+            user_id TEXT NOT NULL, slot TEXT NOT NULL, item_id INTEGER,
+            PRIMARY KEY(user_id, slot))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS rpg_trade_offers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, from_user TEXT NOT NULL, to_user TEXT NOT NULL,
+            item_id INTEGER NOT NULL, gold_amount INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rpg_characters_user ON rpg_characters(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rpg_history_user ON rpg_gacha_history(user_id)")
 
@@ -187,6 +259,26 @@ def get_characters(user_id):
                 WHEN 'Rare' THEN 3 ELSE 4 END, name COLLATE NOCASE
         """, (str(user_id),)).fetchall()
 
+
+def equipment_stats(user_id):
+    with get_connection() as conn:
+        rows = conn.execute("SELECT e.atk_bonus,e.hp_bonus,e.def_bonus FROM rpg_equipment_loadout l JOIN rpg_equipment_inventory e ON e.id=l.item_id WHERE l.user_id=?", (str(user_id),)).fetchall()
+    return tuple(sum(row[i] for row in rows) for i in range(3))
+
+def add_equipment(user_id, item, class_name="Any", bound=0, source="gacha"):
+    name, slot, rarity, atk, hp, defense = item
+    with get_connection() as conn:
+        cur = conn.execute("INSERT INTO rpg_equipment_inventory(user_id,item_name,slot,rarity,atk_bonus,hp_bonus,def_bonus,class_name,bound,source) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (str(user_id),name,slot,rarity,atk,hp,defense,class_name,int(bound),source))
+        return cur.lastrowid
+
+def owned_equipment(user_id):
+    with get_connection() as conn:
+        return conn.execute("SELECT id,item_name,slot,rarity,atk_bonus,hp_bonus,def_bonus,class_name,bound,source FROM rpg_equipment_inventory WHERE user_id=? ORDER BY id", (str(user_id),)).fetchall()
+
+def equipment_item_by_name(name):
+    return next((item for pool in CLASS_EQUIPMENT.values() for item in pool if item[0].casefold()==name.casefold()), None)
+
 def gain_exp(user_id, amount):
     with get_connection() as conn:
         row = conn.execute("SELECT level, exp FROM rpg_players WHERE user_id=?", (str(user_id),)).fetchone()
@@ -200,6 +292,15 @@ def gain_exp(user_id, amount):
             level += 1
             gained += 1
         conn.execute("UPDATE rpg_players SET level=?, exp=? WHERE user_id=?", (level, exp, str(user_id)))
+        if gained:
+            stats = stats_for_level(
+                conn.execute("SELECT class_name FROM rpg_players WHERE user_id=?", (str(user_id),)).fetchone()[0],
+                level,
+            )
+            conn.execute(
+                "UPDATE rpg_players SET hp=?, mp=?, atk=?, defense=? WHERE user_id=?",
+                (stats["hp"], stats["mp"], stats["atk"], stats["def"], str(user_id)),
+            )
         return level, exp, gained
 
 def channel_for(ctx, key):
@@ -267,7 +368,7 @@ class AdventureView(discord.ui.View):
         await interaction.response.defer()
         try:
             player = ensure_player(self.author_id, str(interaction.user))
-            level, atk, defense = player[2], player[11], player[12]
+            level, atk, defense = player[2], player[11] + self.gear_atk, player[12] + self.gear_def
 
             if action == "skill":
                 self.mp -= 15
@@ -359,10 +460,12 @@ class SecretBossView(discord.ui.View):
         self.boss_key = boss_key
         self.boss = boss.copy()
         self.max_hp = boss["hp"]
-        self.members = {m.id: {"member": m, "hp": ensure_player(m.id, str(m))[9],
-                               "max_hp": ensure_player(m.id, str(m))[9],
-                               "mp": ensure_player(m.id, str(m))[10],
-                               "max_mp": ensure_player(m.id, str(m))[10]} for m in members}
+        self.members = {}
+        for m in members:
+            p = ensure_player(m.id, str(m))
+            _, gear_hp, _ = equipment_stats(m.id)
+            self.members[m.id] = {"member": m, "hp": p[9]+gear_hp, "max_hp": p[9]+gear_hp,
+                                  "mp": p[10], "max_mp": p[10]}
         self.turn = 0
         self.finished = False
         self.locked = False
@@ -393,7 +496,8 @@ class SecretBossView(discord.ui.View):
         try:
             d = self.members[interaction.user.id]
             player = ensure_player(interaction.user.id, str(interaction.user))
-            level, atk, defense = player[2], player[11], player[12]
+            gear_atk, _, gear_def = equipment_stats(interaction.user.id)
+            level, atk, defense = player[2], player[11] + gear_atk, player[12] + gear_def
             if d["hp"] <= 0:
                 await interaction.followup.send("Karakter kamu sudah tumbang dan tidak bisa beraksi lagi.", ephemeral=True)
                 return
@@ -499,8 +603,8 @@ def setup_rpg(bot):
             title="🌑 Fumi RPG",
             description="`!profile` · `!inventory` · `!daily` · `!gacha coin|mana|orb|void`\n"
                         "`!collection` · `!class` · `!adventure basic|hard|nightmare`\n"
-                        "`!difficulty` · `!bosses` · `!bossfight` · `!party @anggota` · `!pvp @anggota`\n"
-                        "`!rpg help` untuk bantuan.",
+                        "`!difficulty` · `!bosses` · `!bossfight` · `!fieldbosses` · `!shop` · `!equipgacha`\n"
+                        "`!party @anggota` · `!pvp @anggota` · `!rpg help` untuk bantuan.",
             color=discord.Color.dark_purple()))
 
     @rpg.command(name="help")
@@ -510,7 +614,9 @@ def setup_rpg(bot):
             "`!gacha coin|mana|orb|void`, `!collection [@anggota]`\n"
             "`!class`, `!class choose Warrior|Mage|Archer|Healer|Assassin`\n"
             "`!adventure basic|hard|nightmare`, `!difficulty`, `!bosses`, `!bossfight`\n"
-            "`!party @anggota`, `!pvp @anggota`, `!rpgstatus`"))
+            "`!party @anggota`, `!pvp @anggota`, `!rpgstatus`\n"
+            "`!shop`, `!buy <nama item>`, `!sell <id>`, `!equipgacha`, `!equipments`, `!equipment`\n"
+            "`!equip <id>`, `!unequip weapon|armor`, `!trade @anggota <id_item> [gold]`, `!tradeaccept <id>`"))
 
     @bot.command(name="profile", aliases=["profil"])
     async def profile(ctx, member: discord.Member = None):
@@ -583,6 +689,169 @@ def setup_rpg(bot):
                         ("Duplikat: +10 shards." if duplicate else "Karakter baru ditambahkan."),
             color=discord.Color.dark_purple()))
 
+
+    @bot.command(name="equipgacha", aliases=["gachaequip", "equipmentgacha"])
+    async def equipgacha(ctx):
+        p = ensure_player(ctx.author.id, str(ctx.author))
+        pool = CLASS_EQUIPMENT.get(p[8], [])
+        if not pool:
+            await rpg_send(ctx, "gacha", content="Class kamu belum punya pool equipment.")
+            return
+        if p[4] < EQUIPMENT_GACHA_COST:
+            await rpg_send(ctx, "gacha", content=f"❌ Butuh {EQUIPMENT_GACHA_COST} Gold Coin.")
+            return
+        rarity = random.choices([x[0] for x in EQUIPMENT_GACHA_ODDS], weights=[x[1] for x in EQUIPMENT_GACHA_ODDS], k=1)[0]
+        item = random.choice([x for x in pool if x[2] == rarity])
+        with get_connection() as conn:
+            conn.execute("UPDATE rpg_players SET gold_coin=gold_coin-? WHERE user_id=?", (EQUIPMENT_GACHA_COST,str(ctx.author.id)))
+        item_id = add_equipment(ctx.author.id,item,p[8],0,"gacha")
+        name,slot,rarity,atk,hp,defense = item
+        await rpg_send(ctx,"gacha",embed=discord.Embed(title=f"🎲 Equipment Gacha — {rarity}",description=f"**{name}** · {slot.title()} · Class {p[8]}\nATK +{atk} · HP +{hp} · DEF +{defense}\nID `{item_id}` · Biaya {EQUIPMENT_GACHA_COST} Gold",color=discord.Color.gold() if rarity=="Mythic" else discord.Color.dark_purple()))
+
+    @bot.command(name="equipments", aliases=["equiplist","equipmentinventory"])
+    async def equipments(ctx):
+        ensure_player(ctx.author.id,str(ctx.author))
+        rows=owned_equipment(ctx.author.id)
+        if not rows:
+            await rpg_send(ctx,"menu",content="🎒 Inventory equipment kosong. Gunakan `!equipgacha` atau `!shop`.")
+            return
+        with get_connection() as conn:
+            equipped={r[0] for r in conn.execute("SELECT item_id FROM rpg_equipment_loadout WHERE user_id=? AND item_id IS NOT NULL",(str(ctx.author.id),))}
+        lines=[f"`ID {r[0]}` **{r[1]}** [{r[3]} {r[2]}] — ATK +{r[4]} HP +{r[5]} DEF +{r[6]}"+(" · **TERPASANG**" if r[0] in equipped else "")+(" · 🔒 Bound" if r[8] else "") for r in rows]
+        await rpg_send(ctx,"menu",content="**🎒 Equipment Inventory**\n"+"\n".join(lines[:35]))
+
+    @bot.command(name="equipment", aliases=["gear","loadout"])
+    async def equipment(ctx):
+        ensure_player(ctx.author.id,str(ctx.author))
+        with get_connection() as conn:
+            rows=conn.execute("SELECT l.slot,e.id,e.item_name,e.rarity,e.atk_bonus,e.hp_bonus,e.def_bonus FROM rpg_equipment_loadout l LEFT JOIN rpg_equipment_inventory e ON e.id=l.item_id WHERE l.user_id=?",(str(ctx.author.id),)).fetchall()
+        by_slot={r[0]:r for r in rows}
+        lines=[]
+        for slot in ("weapon","armor"):
+            r=by_slot.get(slot)
+            lines.append(f"**{slot.title()}:** "+(f"`ID {r[1]}` {r[2]} [{r[3]}] · ATK +{r[4]} HP +{r[5]} DEF +{r[6]}" if r and r[1] else "— Kosong —"))
+        atk,hp,defense=equipment_stats(ctx.author.id)
+        await rpg_send(ctx,"menu",content="**⚔️ Equipment Terpasang**\n"+"\n".join(lines)+f"\nBonus total: ATK +{atk} · HP +{hp} · DEF +{defense}")
+
+    @bot.command(name="equip")
+    async def equip(ctx,item_id:int):
+        ensure_player(ctx.author.id,str(ctx.author))
+        with get_connection() as conn:
+            item=conn.execute("SELECT id,item_name,slot,class_name FROM rpg_equipment_inventory WHERE id=? AND user_id=?",(item_id,str(ctx.author.id))).fetchone()
+            player=conn.execute("SELECT class_name FROM rpg_players WHERE user_id=?",(str(ctx.author.id),)).fetchone()
+            if not item:
+                await rpg_send(ctx,"menu",content="❌ ID equipment tidak ditemukan.")
+                return
+            if item[3] not in ("Any",player[0]):
+                await rpg_send(ctx,"menu",content=f"❌ Equipment ini khusus class {item[3]}.")
+                return
+            conn.execute("INSERT INTO rpg_equipment_loadout(user_id,slot,item_id) VALUES(?,?,?) ON CONFLICT(user_id,slot) DO UPDATE SET item_id=excluded.item_id",(str(ctx.author.id),item[2],item[0]))
+        await rpg_send(ctx,"menu",content=f"✅ **{item[1]}** dipasang sebagai {item[2]}.")
+
+    @bot.command(name="unequip")
+    async def unequip(ctx,slot:str):
+        slot=slot.lower()
+        if slot not in ("weapon","armor"):
+            await rpg_send(ctx,"menu",content="Gunakan `!unequip weapon` atau `!unequip armor`.")
+            return
+        with get_connection() as conn:
+            cur=conn.execute("DELETE FROM rpg_equipment_loadout WHERE user_id=? AND slot=?",(str(ctx.author.id),slot))
+        await rpg_send(ctx,"menu",content="✅ Equipment dilepas." if cur.rowcount else "Slot itu sudah kosong.")
+
+    @bot.command(name="shop", aliases=["toko"])
+    async def shop(ctx):
+        lines=[]
+        for name,price in EQUIPMENT_SHOP.items():
+            item=equipment_item_by_name(name)
+            if item:
+                lines.append(f"**{name}** — {price} Gold · {item[1].title()} · ATK +{item[3]} HP +{item[4]} DEF +{item[5]}")
+        await rpg_send(ctx,"menu",content="**🏪 Fumi Equipment Shop**\n"+"\n".join(lines)+"\n\nBeli dengan `!buy nama item`. Limited drop-only tidak dijual.")
+
+    @bot.command(name="buy")
+    async def buy(ctx,*,item_name:str):
+        p=ensure_player(ctx.author.id,str(ctx.author))
+        matched=next(((name,price) for name,price in EQUIPMENT_SHOP.items() if name.casefold()==item_name.strip().casefold()),None)
+        if not matched:
+            await rpg_send(ctx,"menu",content="❌ Item tidak ada di toko. Cek `!shop`.")
+            return
+        name,price=matched
+        item=equipment_item_by_name(name)
+        if not item or item[2]!="Basic":
+            await rpg_send(ctx,"menu",content="❌ Toko hanya menjual equipment Basic pilihan.")
+            return
+        if p[4]<price:
+            await rpg_send(ctx,"menu",content=f"❌ Gold tidak cukup. Harga {price} Gold.")
+            return
+        with get_connection() as conn:
+            conn.execute("UPDATE rpg_players SET gold_coin=gold_coin-? WHERE user_id=?",(price,str(ctx.author.id)))
+        item_id=add_equipment(ctx.author.id,item,"Any",0,"shop")
+        await rpg_send(ctx,"menu",content=f"🛒 Berhasil membeli **{name}** seharga {price} Gold. ID `{item_id}`.")
+
+    @bot.command(name="sell")
+    async def sell(ctx,item_id:int):
+        ensure_player(ctx.author.id,str(ctx.author))
+        with get_connection() as conn:
+            item=conn.execute("SELECT item_name,rarity,bound FROM rpg_equipment_inventory WHERE id=? AND user_id=?",(item_id,str(ctx.author.id))).fetchone()
+            equipped=conn.execute("SELECT 1 FROM rpg_equipment_loadout WHERE user_id=? AND item_id=?",(str(ctx.author.id),item_id)).fetchone()
+            if not item:
+                await rpg_send(ctx,"menu",content="❌ Item tidak ditemukan.")
+                return
+            if item[2] or item[1]=="Limited":
+                await rpg_send(ctx,"menu",content="🔒 Equipment Limited terikat ke pemilik dan tidak bisa dijual.")
+                return
+            if equipped:
+                await rpg_send(ctx,"menu",content="Lepas equipment dahulu dengan `!unequip weapon` atau `!unequip armor`.")
+                return
+            price=max(25,int(EQUIPMENT_SHOP.get(item[0],100)*0.45))
+            conn.execute("DELETE FROM rpg_equipment_inventory WHERE id=? AND user_id=?",(item_id,str(ctx.author.id)))
+            conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+? WHERE user_id=?",(price,str(ctx.author.id)))
+        await rpg_send(ctx,"menu",content=f"💰 **{item[0]}** terjual seharga {price} Gold.")
+
+    @bot.command(name="trade")
+    async def trade(ctx,member:discord.Member,item_id:int,gold_amount:int=0):
+        ensure_player(ctx.author.id,str(ctx.author)); ensure_player(member.id,str(member))
+        if member.bot or member.id==ctx.author.id or gold_amount<0:
+            await rpg_send(ctx,"menu",content="❌ Target trade tidak valid.")
+            return
+        with get_connection() as conn:
+            item=conn.execute("SELECT id,item_name,bound FROM rpg_equipment_inventory WHERE id=? AND user_id=?",(item_id,str(ctx.author.id))).fetchone()
+            equipped=conn.execute("SELECT 1 FROM rpg_equipment_loadout WHERE user_id=? AND item_id=?",(str(ctx.author.id),item_id)).fetchone()
+            gold=conn.execute("SELECT gold_coin FROM rpg_players WHERE user_id=?",(str(ctx.author.id),)).fetchone()[0]
+            if not item or equipped:
+                await rpg_send(ctx,"menu",content="❌ Item tidak ditemukan atau masih terpasang.")
+                return
+            if item[2]:
+                await rpg_send(ctx,"menu",content="🔒 Limited terikat pada pemilik dan tidak bisa ditrade.")
+                return
+            if gold_amount>gold:
+                await rpg_send(ctx,"menu",content="❌ Gold kamu tidak cukup.")
+                return
+            offer_id=conn.execute("INSERT INTO rpg_trade_offers(from_user,to_user,item_id,gold_amount) VALUES(?,?,?,?)",(str(ctx.author.id),str(member.id),item_id,gold_amount)).lastrowid
+        await rpg_send(ctx,"menu",content=f"🤝 {member.mention}, **{ctx.author.display_name}** menawarkan **{item[1]}** + {gold_amount:,} Gold. Terima dengan `!tradeaccept {offer_id}`.")
+
+    @bot.command(name="tradeaccept")
+    async def tradeaccept(ctx,offer_id:int):
+        ensure_player(ctx.author.id,str(ctx.author))
+        with get_connection() as conn:
+            offer=conn.execute("SELECT from_user,to_user,item_id,gold_amount,status FROM rpg_trade_offers WHERE id=?",(offer_id,)).fetchone()
+            if not offer or offer[4]!="pending" or offer[1]!=str(ctx.author.id):
+                await rpg_send(ctx,"menu",content="❌ Trade tidak ditemukan, sudah selesai, atau bukan untuk kamu.")
+                return
+            sender,receiver,item_id,gold_amount,_=offer
+            gold=conn.execute("SELECT gold_coin FROM rpg_players WHERE user_id=?",(sender,)).fetchone()
+            item=conn.execute("SELECT item_name,bound FROM rpg_equipment_inventory WHERE id=? AND user_id=?",(item_id,sender)).fetchone()
+            equipped=conn.execute("SELECT 1 FROM rpg_equipment_loadout WHERE user_id=? AND item_id=?",(sender,item_id)).fetchone()
+            if not item or item[1] or equipped or not gold or gold[0]<gold_amount:
+                conn.execute("UPDATE rpg_trade_offers SET status='cancelled' WHERE id=?",(offer_id,))
+                await rpg_send(ctx,"menu",content="❌ Trade dibatalkan karena item/saldo pengirim berubah.")
+                return
+            conn.execute("UPDATE rpg_players SET gold_coin=gold_coin-? WHERE user_id=?",(gold_amount,sender))
+            conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+? WHERE user_id=?",(gold_amount,receiver))
+            conn.execute("UPDATE rpg_equipment_inventory SET user_id=? WHERE id=?",(receiver,item_id))
+            conn.execute("UPDATE rpg_trade_offers SET status='accepted' WHERE id=?",(offer_id,))
+        await rpg_send(ctx,"menu",content=f"✅ Trade #{offer_id} selesai: **{item[0]}** dan {gold_amount:,} Gold dikirim ke {ctx.author.mention}.")
+
+
     @bot.command(name="collection", aliases=["koleksi", "characters"])
     async def collection(ctx, member: discord.Member = None):
         member = member or ctx.author
@@ -613,9 +882,23 @@ def setup_rpg(bot):
         s = CLASSES[class_name]
         ensure_player(ctx.author.id, str(ctx.author))
         with get_connection() as conn:
+            level = conn.execute("SELECT level FROM rpg_players WHERE user_id=?", (str(ctx.author.id),)).fetchone()[0]
+            stats = stats_for_level(class_name, level)
             conn.execute("UPDATE rpg_players SET class_name=?, hp=?, mp=?, atk=?, defense=? WHERE user_id=?",
-                         (class_name, s["hp"], s["mp"], s["atk"], s["def"], str(ctx.author.id)))
-        await rpg_send(ctx, "menu", content=f"✨ Class berubah menjadi **{class_name}**. Skill utama: **{s['skill']}**.")
+                         (class_name, stats["hp"], stats["mp"], stats["atk"], stats["def"], str(ctx.author.id)))
+        await rpg_send(ctx, "menu", content=(f"✨ Class berubah menjadi **{class_name}**. Skill utama: **{s['skill']}**.\n"
+            f"Stat level {level}: HP {stats['hp']:,} · MP {stats['mp']:,} · ATK {stats['atk']:,} · DEF {stats['def']:,}."))
+
+    @bot.command(name="syncstats", aliases=["statupgrade", "naikstat"])
+    async def syncstats(ctx):
+        ensure_player(ctx.author.id, str(ctx.author))
+        stats = sync_player_stats(ctx.author.id, refill=True)
+        p = ensure_player(ctx.author.id, str(ctx.author))
+        await rpg_send(ctx, "menu", content=(
+            f"📈 Statistik **{ctx.author.display_name}** disesuaikan dengan level **{p[2]:,}**!\n"
+            f"❤️ HP: **{stats['hp']:,}**\n💧 MP: **{stats['mp']:,}**\n"
+            f"⚔️ ATK: **{stats['atk']:,}**\n🛡️ DEF: **{stats['def']:,}**\n"
+            "Statistik bertambah otomatis setiap naik level."))
 
     @bot.command(name="difficulty", aliases=["kesulitan"])
     async def difficulty(ctx):
@@ -640,6 +923,41 @@ def setup_rpg(bot):
                                f"Monster HP: **{monster['hp']}** · ATK: **{monster['atk']}**\n"
                                f"HP kamu: **{view.hp}/{view.max_hp}** · MP: **{view.mp}/{view.max_mp}**",
                        view=view)
+
+
+    @bot.command(name="fieldbosses", aliases=["fieldboss"])
+    async def fieldbosses(ctx):
+        lines=[f"`{k}` **{b['name']}** · {b['difficulty']} · HP {b['hp']:,} · ATK {b['atk']:,}\nDrop: **{b['drop']}** ({int(b['chance']*100)}%, Limited/Bound)" for k,b in FIELD_BOSSES.items()]
+        await rpg_send(ctx,"boss",content="**👹 Field Bosses**\n"+"\n\n".join(lines)+"\n\nLawan dengan `!fieldbossfight <key>`.")
+
+    @bot.command(name="fieldbossfight", aliases=["fboss"])
+    async def fieldbossfight(ctx,boss_key:str=None):
+        ensure_player(ctx.author.id,str(ctx.author))
+        if not boss_key or boss_key.lower() not in FIELD_BOSSES:
+            await rpg_send(ctx,"boss",content="Gunakan `!fieldbosses`, lalu `!fieldbossfight basic1` (basic2, hard1, hard2, nightmare1).")
+            return
+        key=boss_key.lower(); boss=FIELD_BOSSES[key]; p=ensure_player(ctx.author.id,str(ctx.author))
+        gear_atk,gear_hp,gear_def=equipment_stats(ctx.author.id)
+        max_hp=p[9]+gear_hp; hp=max_hp; boss_hp=boss["hp"]; atk=p[11]+gear_atk; defense=p[12]+gear_def; turns=0
+        while hp>0 and boss_hp>0 and turns<100:
+            turns+=1; boss_hp-=max(1,int(atk+p[2]*2-boss["def"]*0.25))
+            if boss_hp>0: hp-=max(1,int(boss["atk"]-defense*0.4))
+        if boss_hp<=0:
+            gain_exp(ctx.author.id,boss["exp"])
+            with get_connection() as conn:
+                conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+?,wins=wins+1 WHERE user_id=?",(boss["gold"],str(ctx.author.id)))
+            drop=None
+            if random.random()<boss["chance"]:
+                slot,rarity,da,dh,dd=LIMITED_EQUIPMENT[boss["drop"]]
+                add_equipment(ctx.author.id,(boss["drop"],slot,rarity,da,dh,dd),"Any",1,"field_boss")
+                drop=boss["drop"]
+            result=f"🏆 **{boss['name']} dikalahkan!**\nHadiah: {boss['exp']:,} EXP · {boss['gold']:,} Gold.\nHP tersisa: {max(0,hp):,}/{max_hp:,} · Giliran: {turns}"
+            result+=f"\n🎁 Limited drop: **{drop}** — terikat ke akunmu." if drop else f"\nDrop tidak jatuh kali ini ({int(boss['chance']*100)}% peluang)."
+        else:
+            with get_connection() as conn: conn.execute("UPDATE rpg_players SET losses=losses+1 WHERE user_id=?",(str(ctx.author.id),))
+            result=f"💀 Kalah melawan **{boss['name']}**. Boss tersisa sekitar {max(0,boss_hp):,} HP. Tingkatkan level/equipment lalu coba lagi."
+        await rpg_send(ctx,"boss",content=result)
+
 
     @bot.command(name="bosses", aliases=["secretboss"])
     async def bosses(ctx):
@@ -852,12 +1170,15 @@ def setup_rpg(bot):
                 (str(member.id),)
             ).fetchone()
             before = row[0]
+            class_name = conn.execute("SELECT class_name FROM rpg_players WHERE user_id=?", (str(member.id),)).fetchone()[0]
+            stats = stats_for_level(class_name, level)
             conn.execute(
-                "UPDATE rpg_players SET level=?, exp=0 WHERE user_id=?",
-                (level, str(member.id))
+                "UPDATE rpg_players SET level=?, exp=0, hp=?, mp=?, atk=?, defense=? WHERE user_id=?",
+                (level, stats["hp"], stats["mp"], stats["atk"], stats["def"], str(member.id))
             )
         await ctx.send(
-            f"🔐 Level {member.mention}: **{before} → {level}** (EXP diatur ke 0).",
+            f"🔐 Level {member.mention}: **{before} → {level}** (EXP diatur ke 0).\n"
+            f"Stat baru: HP {stats['hp']:,} · MP {stats['mp']:,} · ATK {stats['atk']:,} · DEF {stats['def']:,}.",
             delete_after=15
         )
 
