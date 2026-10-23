@@ -1,4 +1,3 @@
-
 import os
 from datetime import timedelta
 
@@ -9,6 +8,8 @@ from dotenv import load_dotenv
 import config
 import database
 from detector import detect_words
+from games import setup_games
+from quiz import setup_quiz
 
 
 # =========================
@@ -33,6 +34,10 @@ bot = commands.Bot(
     command_prefix="!",
     intents=intents
 )
+
+# Daftarkan fitur game dan kuis pada bot yang sama
+setup_games(bot)
+setup_quiz(bot)
 
 
 # =========================
@@ -95,6 +100,8 @@ async def on_ready():
     print(f"Bot berhasil online sebagai {bot.user}")
     print("Database siap.")
     print("Moderation system aktif.")
+    print("Game system terdaftar.")
+    print("Quiz system terdaftar.")
 
     if LOG_CHANNEL_ID:
         print(f"Mod Log dikonfigurasi: {LOG_CHANNEL_ID}")
@@ -120,29 +127,29 @@ async def on_message(message):
 
     detected = detect_words(message.content)
 
-# Pengecualian untuk cerita tentang hewan
-text_lower = message.content.lower()
+    # Pengecualian untuk cerita tentang hewan
+    text_lower = message.content.lower()
 
-animal_context = [
-    "dikejar sama anjing",
-    "dikejar anjing",
-    "anjingku",
-    "anjing gue",
-    "anjing gw",
-    "anjing peliharaan",
-    "anjing itu menggonggong",
-    "anjingnya menggonggong",
-    "anjing lucu",
-]
-
-if any(phrase in text_lower for phrase in animal_context):
-    detected = [
-        item for item in detected
-        if item["matched"].lower() != "anjing"
+    animal_context = [
+        "dikejar sama anjing",
+        "dikejar anjing",
+        "anjingku",
+        "anjing gue",
+        "anjing gw",
+        "anjing peliharaan",
+        "anjing itu menggonggong",
+        "anjingnya menggonggong",
+        "anjing lucu",
     ]
 
-if detected:
-    
+    if any(phrase in text_lower for phrase in animal_context):
+        detected = [
+            item for item in detected
+            if item["matched"].lower() != "anjing"
+        ]
+
+    if detected:
+
         # =========================
         # HITUNG SCORE
         # =========================
@@ -292,7 +299,7 @@ if detected:
 
         await send_mod_log(message.guild, embed)
 
-    # Tetap proses command seperti !score
+    # Tetap proses command seperti !score, game, dan kuis
     await bot.process_commands(message)
 
 
