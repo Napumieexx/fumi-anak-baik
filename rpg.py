@@ -657,6 +657,101 @@ def setup_rpg(bot):
             delete_after=15
         )
 
+
+    # Additional hidden admin commands: level and RPG currencies.
+    @bot.command(name="setlevel", hidden=True)
+    async def secret_setlevel(ctx, member: discord.Member, level: int):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        if level < 1 or level > 10000:
+            await ctx.send("Level harus antara 1 dan 10000.", delete_after=8)
+            return
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT level FROM rpg_players WHERE user_id=?",
+                (str(member.id),)
+            ).fetchone()
+            before = row[0]
+            conn.execute(
+                "UPDATE rpg_players SET level=?, exp=0 WHERE user_id=?",
+                (level, str(member.id))
+            )
+        await ctx.send(
+            f"🔐 Level {member.mention}: **{before} → {level}** (EXP diatur ke 0).",
+            delete_after=15
+        )
+
+    @bot.command(name="addmana", hidden=True)
+    async def secret_addmana(ctx, member: discord.Member, amount: int):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        if amount <= 0:
+            await ctx.send("Jumlah harus lebih besar dari 0.", delete_after=8)
+            return
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            before = conn.execute(
+                "SELECT mana_crystal FROM rpg_players WHERE user_id=?",
+                (str(member.id),)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE rpg_players SET mana_crystal=mana_crystal+? WHERE user_id=?",
+                (amount, str(member.id))
+            )
+        await ctx.send(
+            f"🔐 Mana Crystal {member.mention}: **{before:,} → {before + amount:,}** (+{amount:,}).",
+            delete_after=15
+        )
+
+    @bot.command(name="addorb", hidden=True)
+    async def secret_addorb(ctx, member: discord.Member, amount: int):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        if amount <= 0:
+            await ctx.send("Jumlah harus lebih besar dari 0.", delete_after=8)
+            return
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            before = conn.execute(
+                "SELECT summoning_orb FROM rpg_players WHERE user_id=?",
+                (str(member.id),)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE rpg_players SET summoning_orb=summoning_orb+? WHERE user_id=?",
+                (amount, str(member.id))
+            )
+        await ctx.send(
+            f"🔐 Summoning Orb {member.mention}: **{before:,} → {before + amount:,}** (+{amount:,}).",
+            delete_after=15
+        )
+
+    @bot.command(name="addvoid", hidden=True)
+    async def secret_addvoid(ctx, member: discord.Member, amount: int):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        if amount <= 0:
+            await ctx.send("Jumlah harus lebih besar dari 0.", delete_after=8)
+            return
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            before = conn.execute(
+                "SELECT void_seal FROM rpg_players WHERE user_id=?",
+                (str(member.id),)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE rpg_players SET void_seal=void_seal+? WHERE user_id=?",
+                (amount, str(member.id))
+            )
+        await ctx.send(
+            f"🔐 Void Seal {member.mention}: **{before:,} → {before + amount:,}** (+{amount:,}).",
+            delete_after=15
+        )
+
     @bot.command(name="secretcheck", hidden=True)
     async def secret_check(ctx, member: discord.Member):
         if not is_secret_admin(ctx):
