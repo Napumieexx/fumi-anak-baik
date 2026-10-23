@@ -152,6 +152,12 @@ def setup_rpg_database():
                 user_id TEXT PRIMARY KEY, rating INTEGER NOT NULL DEFAULT 1000
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rpg_boss_inventory (
+                user_id TEXT NOT NULL, item_key TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, item_key)
+            )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rpg_characters_user ON rpg_characters(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rpg_history_user ON rpg_gacha_history(user_id)")
 
@@ -346,6 +352,119 @@ class AdventureView(discord.ui.View):
     async def heal_button(self, interaction, button):
         await self.update_fight(interaction, "heal")
 
+class SecretBossView(discord.ui.View):
+    """Turn-based solo or co-op Secret Boss battle. Rewards are granted once on victory."""
+    def __init__(self, boss_key, boss, members):
+        super().__init__(timeout=900)
+        self.boss_key = boss_key
+        self.boss = boss.copy()
+        self.max_hp = boss["hp"]
+        self.members = {m.id: {"member": m, "hp": ensure_player(m.id, str(m))[9],
+                               "max_hp": ensure_player(m.id, str(m))[9],
+                               "mp": ensure_player(m.id, str(m))[10],
+                               "max_mp": ensure_player(m.id, str(m))[10]} for m in members}
+        self.turn = 0
+        self.finished = False
+        self.locked = False
+        self.party_mode = len(members) > 1
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id not in self.members:
+            await interaction.response.send_message("Kamu bukan peserta pertarungan ini.", ephemeral=True)
+            return False
+        if self.finished:
+            await interaction.response.send_message("Pertarungan sudah selesai.", ephemeral=True)
+            return False
+        if self.locked:
+            await interaction.response.send_message("Aksi sebelumnya masih diproses, coba sebentar lagi.", ephemeral=True)
+            return False
+        return True
+
+    def status_text(self, last=""):
+        living = [d for d in self.members.values() if d["hp"] > 0]
+        people = "\n".join(f"{d['member'].display_name}: ❤️ {max(0,d['hp'])}/{d['max_hp']} · 💧 {d['mp']}/{d['max_mp']}" for d in self.members.values())
+        return (f"⚔️ **{self.boss['name']}** · {'Party/Co-op' if self.party_mode else 'Solo'}\n"
+                f"👹 Boss HP: **{max(0,self.boss['hp']):,}/{self.max_hp:,}** · ATK {self.boss['atk']:,}\n"
+                f"{people}\n{last}")
+
+    async def act(self, interaction, action):
+        self.locked = True
+        await interaction.response.defer()
+        try:
+            d = self.members[interaction.user.id]
+            player = ensure_player(interaction.user.id, str(interaction.user))
+            level, atk, defense = player[2], player[11], player[12]
+            if d["hp"] <= 0:
+                await interaction.followup.send("Karakter kamu sudah tumbang dan tidak bisa beraksi lagi.", ephemeral=True)
+                return
+            if action == "skill" and d["mp"] < 15:
+                await interaction.followup.send("MP tidak cukup; skill memerlukan 15 MP.", ephemeral=True)
+                return
+            if action == "skill":
+                d["mp"] -= 15
+                damage = max(1, int(atk * (2.0 + level * 0.04) - 25))
+            elif action == "guard":
+                d["hp"] = min(d["max_hp"], d["hp"] + max(12, defense * 2))
+                damage = 0
+            else:
+                damage = max(1, int(atk + level * 2 - 15))
+            # Special boss mechanics alter damage and attack patterns.
+            if self.boss_key == "varkhaz" and self.turn % 3 == 2:
+                damage = int(damage * 0.55)  # Sovereign's Guard
+            if self.boss_key == "noxvyr" and self.turn % 4 == 3:
+                damage = int(damage * 0.7)   # Abyssal Devour
+            self.boss["hp"] -= damage
+            self.turn += 1
+            if self.boss["hp"] <= 0:
+                self.finished = True
+                self.stop()
+                reward_gold = 2500 if self.boss_key == "varkhaz" else 3500 if self.boss_key == "noxvyr" else 5000
+                reward_exp = 1800 if self.boss_key == "varkhaz" else 2500 if self.boss_key == "noxvyr" else 3500
+                drop = SECRET_BOSSES[self.boss_key]["drop"]
+                for uid, data in self.members.items():
+                    if data["hp"] <= 0:
+                        continue
+                    gain_exp(uid, reward_exp)
+                    with get_connection() as conn:
+                        conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+?, wins=wins+1 WHERE user_id=?", (reward_gold, str(uid)))
+                        conn.execute("INSERT INTO rpg_boss_inventory(user_id,item_key,quantity) VALUES(?,?,1) ON CONFLICT(user_id,item_key) DO UPDATE SET quantity=quantity+1", (str(uid), self.boss_key))
+                        conn.execute(f"UPDATE rpg_boss_progress SET {self.boss_key}=1 WHERE user_id=?", (str(uid),))
+                for item in self.children: item.disabled = True
+                await interaction.edit_original_response(content=(self.status_text(f"🏆 **Boss dikalahkan!** Peserta yang masih berdiri menerima **{reward_exp:,} EXP**, **{reward_gold:,} Gold**, dan drop **{drop} ×1**.\nGunakan `!bossinventory` untuk melihat drop. Setelah mengumpulkan ketiga drop unik, gunakan `!nighttrial` untuk menukar semuanya dengan role **The Night Ruler**.")), view=self)
+                return
+            # Boss retaliation: attacks the current actor; Eclipsara phases hit harder every third turn.
+            incoming = max(1, int(self.boss["atk"] - defense * 0.4))
+            if action == "guard": incoming = max(1, incoming // 2)
+            if self.boss_key == "eclipsara" and self.turn % 3 == 0:
+                incoming = int(incoming * 1.7)
+            d["hp"] -= incoming
+            if d["hp"] <= 0:
+                d["hp"] = 0
+                with get_connection() as conn:
+                    conn.execute("UPDATE rpg_players SET losses=losses+1 WHERE user_id=?", (str(interaction.user.id),))
+            if not any(x["hp"] > 0 for x in self.members.values()):
+                self.finished = True
+                self.stop()
+                for item in self.children: item.disabled = True
+                await interaction.edit_original_response(content=self.status_text("💀 **Party tumbang. Boss menang.** Tidak ada hadiah drop kali ini."), view=self)
+                return
+            for item in self.children: item.disabled = False
+            await interaction.edit_original_response(content=self.status_text(f"Aksi {interaction.user.display_name}: **{action}**, damage **{damage}**. Boss membalas **{incoming}** damage."), view=self)
+        except Exception as exc:
+            print(f"[Fumi RPG] Secret boss error: {exc!r}")
+            await interaction.followup.send("Terjadi error saat memproses boss. Admin bisa memeriksa Console FadeHost.", ephemeral=True)
+        finally:
+            self.locked = False
+
+    @discord.ui.button(label="Serang", style=discord.ButtonStyle.primary, emoji="⚔️")
+    async def attack_button(self, interaction, button): await self.act(interaction, "attack")
+
+    @discord.ui.button(label="Skill (15 MP)", style=discord.ButtonStyle.danger, emoji="✨")
+    async def skill_button(self, interaction, button): await self.act(interaction, "skill")
+
+    @discord.ui.button(label="Bertahan/Pulih", style=discord.ButtonStyle.success, emoji="🛡️")
+    async def guard_button(self, interaction, button): await self.act(interaction, "guard")
+
 class PartyInviteView(discord.ui.View):
     def __init__(self, leader, invited):
         super().__init__(timeout=60)
@@ -380,7 +499,7 @@ def setup_rpg(bot):
             title="🌑 Fumi RPG",
             description="`!profile` · `!inventory` · `!daily` · `!gacha coin|mana|orb|void`\n"
                         "`!collection` · `!class` · `!adventure basic|hard|nightmare`\n"
-                        "`!difficulty` · `!bosses` · `!party @anggota` · `!pvp @anggota`\n"
+                        "`!difficulty` · `!bosses` · `!bossfight` · `!party @anggota` · `!pvp @anggota`\n"
                         "`!rpg help` untuk bantuan.",
             color=discord.Color.dark_purple()))
 
@@ -390,7 +509,7 @@ def setup_rpg(bot):
             "**Fumi RPG commands**\n`!profile [@anggota]`, `!inventory`, `!daily`\n"
             "`!gacha coin|mana|orb|void`, `!collection [@anggota]`\n"
             "`!class`, `!class choose Warrior|Mage|Archer|Healer|Assassin`\n"
-            "`!adventure basic|hard|nightmare`, `!difficulty`, `!bosses`\n"
+            "`!adventure basic|hard|nightmare`, `!difficulty`, `!bosses`, `!bossfight`\n"
             "`!party @anggota`, `!pvp @anggota`, `!rpgstatus`"))
 
     @bot.command(name="profile", aliases=["profil"])
@@ -529,11 +648,70 @@ def setup_rpg(bot):
         await rpg_send(ctx, "boss", content="\n\n".join(lines) +
                        "\n\nKalahkan ketiganya dan selesaikan trial **Throne of the Forgotten Night** untuk membuka **The Night Ruler**.")
 
-    @bot.command(name="bossfight")
-    async def bossfight(ctx, boss_key: str = None):
-        await rpg_send(ctx, "boss", content=(
-            "⚠️ Pertarungan Secret Boss belum diaktifkan pada build ini. `!bosses` menampilkan data dan hadiah rencana. "
-            "Aku tidak akan mengklaim boss fight atau trial sudah berjalan sebelum mekaniknya benar-benar terimplementasi."))
+    @bot.command(name="bossfight", aliases=["boss"])
+    async def bossfight(ctx, boss_key: str = None, mode: str = "solo", member1: discord.Member = None, member2: discord.Member = None, member3: discord.Member = None):
+        if not boss_key or boss_key.lower() not in SECRET_BOSSES:
+            await rpg_send(ctx, "boss", content="Pilih boss: `!bossfight varkhaz solo` atau `!bossfight varkhaz party @anggota [@anggota2] [@anggota3]`. Boss: varkhaz, noxvyr, eclipsara.")
+            return
+        key = boss_key.lower()
+        mode = mode.lower()
+        if mode not in ("solo", "party", "coop", "co-op"):
+            await rpg_send(ctx, "boss", content="Mode: `solo` atau `party`. Contoh `!bossfight noxvyr party @anggota`.")
+            return
+        members = [ctx.author]
+        if mode != "solo":
+            members += [m for m in (member1, member2, member3) if m and not m.bot and m.id != ctx.author.id]
+            # Deduplicate participants
+            members = list({m.id: m for m in members}.values())
+            if len(members) < 2:
+                await rpg_send(ctx, "boss", content="Mode party perlu minimal satu teman. Contoh: `!bossfight varkhaz party @anggota`.")
+                return
+        for m in members: ensure_player(m.id, str(m))
+        view = SecretBossView(key, SECRET_BOSSES[key], members)
+        await rpg_send(ctx, "boss", content=view.status_text("Tekan tombol untuk bertindak. Semua peserta boleh bergiliran; boss membalas setiap aksi."), view=view)
+
+    @bot.command(name="bossinventory", aliases=["bossinv", "bossitems"])
+    async def bossinventory(ctx, member: discord.Member = None):
+        member = member or ctx.author
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            rows = conn.execute("SELECT item_key, quantity FROM rpg_boss_inventory WHERE user_id=? AND quantity>0", (str(member.id),)).fetchall()
+        labels = {k: v["drop"] for k,v in SECRET_BOSSES.items()}
+        lines = [f"• **{labels.get(k,k)}** ×{q}" for k,q in rows]
+        await rpg_send(ctx, "boss", content=f"🎒 **Boss inventory — {member.display_name}**\n" + ("\n".join(lines) if lines else "Belum punya drop boss.") + "\nKumpulkan ketiga drop unik untuk menukar menjadi role **The Night Ruler** lewat `!nighttrial`.")
+
+    @bot.command(name="nighttrial", aliases=["bossredeem", "redeemnight"])
+    async def nighttrial(ctx):
+        if not ctx.guild:
+            await ctx.send("Command ini hanya bisa digunakan di server.")
+            return
+        uid = str(ctx.author.id)
+        ensure_player(ctx.author.id, str(ctx.author))
+        with get_connection() as conn:
+            progress = conn.execute("SELECT varkhaz,noxvyr,eclipsara,trial_complete FROM rpg_boss_progress WHERE user_id=?", (uid,)).fetchone()
+            items = dict(conn.execute("SELECT item_key,quantity FROM rpg_boss_inventory WHERE user_id=?", (uid,)).fetchall())
+            if progress and progress[3]:
+                await rpg_send(ctx, "boss", content="Kamu sudah menyelesaikan Throne of the Forgotten Night.")
+                return
+            if not progress or not all(progress[i] for i in range(3)) or not all(items.get(k,0)>0 for k in SECRET_BOSSES):
+                await rpg_send(ctx, "boss", content="🔒 Trial terkunci. Kalahkan ketiga Secret Boss dan miliki masing-masing satu drop unik. Cek `!bossinventory`.")
+                return
+            role = discord.utils.get(ctx.guild.roles, name=SECRET_CLASS)
+            if role is None:
+                await rpg_send(ctx, "boss", content=f"Role **{SECRET_CLASS}** belum ada di server. Admin perlu membuat role itu dan memastikan role bot berada di atasnya.")
+                return
+            if not ctx.guild.me.guild_permissions.manage_roles or role >= ctx.guild.me.top_role:
+                await rpg_send(ctx, "boss", content="Bot tidak punya izin/posisi role yang cukup untuk memberikan role itu. Aktifkan Manage Roles dan pindahkan role bot di atas role hadiah.")
+                return
+            try:
+                await ctx.author.add_roles(role, reason="Completed Fumi RPG Secret Boss trial")
+            except discord.Forbidden:
+                await rpg_send(ctx, "boss", content="Discord menolak pemberian role. Periksa izin Manage Roles dan hierarki role bot.")
+                return
+            for k in SECRET_BOSSES:
+                conn.execute("UPDATE rpg_boss_inventory SET quantity=quantity-1 WHERE user_id=? AND item_key=?", (uid,k))
+            conn.execute("UPDATE rpg_boss_progress SET trial_complete=1 WHERE user_id=?", (uid,))
+        await rpg_send(ctx, "boss", content=f"👑 **Throne of the Forgotten Night selesai!** {ctx.author.mention} menukar tiga drop unik dan menerima role **{SECRET_CLASS}**.")
 
     @bot.command(name="party")
     async def party(ctx, member: discord.Member = None):
@@ -558,7 +736,7 @@ def setup_rpg(bot):
         await rpg_send(ctx, "menu", content=(
             "Fumi RPG module aktif: profil, statistik dasar, class pilihan, daily, gacha, koleksi, "
             "petualangan monster berbasis tombol, kesulitan dan info Secret Boss.\n"
-            "Belum aktif penuh: boss fight/trial rahasia, party co-op persisten, dan duel PvP."))
+            "Secret Boss solo/co-op, drop inventory, dan trial penukaran role aktif. Duel PvP belum aktif."))
 
 
     # Secret admin commands: deliberately omitted from public RPG help/menu.
