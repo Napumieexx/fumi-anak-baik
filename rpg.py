@@ -523,4 +523,115 @@ def setup_rpg(bot):
             "petualangan monster berbasis tombol, kesulitan dan info Secret Boss.\n"
             "Belum aktif penuh: boss fight/trial rahasia, party co-op persisten, dan duel PvP."))
 
+
+    # Secret admin commands: deliberately omitted from public RPG help/menu.
+    # Configure SECRET_ADMIN_IDS with Discord user IDs, separated by commas.
+    # Server administrators are also allowed to use these commands.
+    import os
+
+    def is_secret_admin(ctx):
+        configured = {
+            item.strip()
+            for item in os.getenv("SECRET_ADMIN_IDS", "").split(",")
+            if item.strip().isdigit()
+        }
+        return (
+            ctx.author.id in {int(item) for item in configured}
+            or (ctx.guild is not None and ctx.author.guild_permissions.administrator)
+        )
+
+    async def secret_denied(ctx):
+        # Keep command discovery and unauthorized attempts quiet.
+        try:
+            await ctx.message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
+    @bot.command(name="addgold", hidden=True)
+    async def secret_addgold(ctx, member: discord.Member, amount: int):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        if amount <= 0:
+            await ctx.send("Jumlah harus lebih besar dari 0.", delete_after=8)
+            return
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            before = conn.execute(
+                "SELECT gold_coin FROM rpg_players WHERE user_id=?",
+                (str(member.id),)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE rpg_players SET gold_coin=gold_coin+? WHERE user_id=?",
+                (amount, str(member.id))
+            )
+            after = before + amount
+        await ctx.send(
+            f"🔐 Gold {member.mention}: **{before:,} → {after:,}** (+{amount:,}).",
+            delete_after=15
+        )
+
+    @bot.command(name="removegold", hidden=True)
+    async def secret_removegold(ctx, member: discord.Member, amount: int):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        if amount <= 0:
+            await ctx.send("Jumlah harus lebih besar dari 0.", delete_after=8)
+            return
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT gold_coin FROM rpg_players WHERE user_id=?",
+                (str(member.id),)
+            ).fetchone()
+            before = row[0]
+            after = max(0, before - amount)
+            conn.execute(
+                "UPDATE rpg_players SET gold_coin=? WHERE user_id=?",
+                (after, str(member.id))
+            )
+        await ctx.send(
+            f"🔐 Gold {member.mention}: **{before:,} → {after:,}** (-{before-after:,}; saldo tidak bisa negatif).",
+            delete_after=15
+        )
+
+    @bot.command(name="setgold", hidden=True)
+    async def secret_setgold(ctx, member: discord.Member, amount: int):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        if amount < 0:
+            await ctx.send("Gold tidak boleh negatif.", delete_after=8)
+            return
+        ensure_player(member.id, str(member))
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT gold_coin FROM rpg_players WHERE user_id=?",
+                (str(member.id),)
+            ).fetchone()
+            before = row[0]
+            conn.execute(
+                "UPDATE rpg_players SET gold_coin=? WHERE user_id=?",
+                (amount, str(member.id))
+            )
+        await ctx.send(
+            f"🔐 Gold {member.mention}: **{before:,} → {amount:,}**.",
+            delete_after=15
+        )
+
+    @bot.command(name="secretcheck", hidden=True)
+    async def secret_check(ctx, member: discord.Member):
+        if not is_secret_admin(ctx):
+            await secret_denied(ctx)
+            return
+        p = ensure_player(member.id, str(member))
+        await ctx.send(
+            f"🔐 RPG check — {member.mention}\\n"
+            f"Level: **{p[2]}** · EXP: **{p[3]}**\\n"
+            f"Gold: **{p[4]:,}** · Mana: **{p[5]}** · Orb: **{p[6]}** · Void Seal: **{p[7]}**",
+            delete_after=20
+        )
+
+
     print("RPG system terdaftar.")
