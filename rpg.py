@@ -337,6 +337,10 @@ class AdventureView(discord.ui.View):
         self.mp = None
         self.max_mp = None
         self.player = None
+        # Bonus equipment harus tersedia sebelum aksi pertarungan diproses.
+        self.gear_atk = 0
+        self.gear_hp = 0
+        self.gear_def = 0
         self.finished = False
 
     async def interaction_check(self, interaction):
@@ -347,7 +351,9 @@ class AdventureView(discord.ui.View):
 
     async def start(self):
         self.player = ensure_player(self.author_id, "player")
-        self.max_hp, self.max_mp = self.player[9], self.player[10]
+        self.gear_atk, self.gear_hp, self.gear_def = equipment_stats(self.author_id)
+        self.max_hp = self.player[9] + self.gear_hp
+        self.max_mp = self.player[10]
         self.hp, self.mp = self.max_hp, self.max_mp
 
     def disable_all_items(self):
