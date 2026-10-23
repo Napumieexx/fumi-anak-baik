@@ -120,8 +120,28 @@ async def on_message(message):
 
     detected = detect_words(message.content)
 
-    if detected:
+# Pengecualian untuk cerita tentang hewan
+text_lower = message.content.lower()
 
+animal_context = [
+    "dikejar sama anjing",
+    "dikejar anjing",
+    "anjingku",
+    "anjing gue",
+    "anjing gw",
+    "anjing peliharaan",
+    "anjing itu menggonggong",
+    "anjingnya menggonggong",
+    "anjing lucu",
+]
+
+if any(phrase in text_lower for phrase in animal_context):
+    detected = [
+        item for item in detected
+        if item["matched"].lower() != "anjing"
+    ]
+
+if detected:
         # =========================
         # HITUNG SCORE
         # =========================
