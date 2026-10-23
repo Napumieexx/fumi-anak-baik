@@ -243,6 +243,11 @@ class AdventureView(discord.ui.View):
         self.max_hp, self.max_mp = self.player[9], self.player[10]
         self.hp, self.mp = self.max_hp, self.max_mp
 
+    def disable_all_items(self):
+        """Disable every Adventure button when the fight ends."""
+        for item in self.children:
+            item.disabled = True
+
     async def update_fight(self, interaction, action):
         # Reply to Discord immediately so the interaction does not expire while
         # SQLite or combat calculations are running.
