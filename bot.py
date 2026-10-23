@@ -11,6 +11,7 @@ from detector import detect_words
 from games import setup_games
 from quiz import setup_quiz
 from menu import setup_menu
+from rpg import setup_rpg
 
 
 # =========================
@@ -40,6 +41,7 @@ bot = commands.Bot(
 setup_games(bot)
 setup_quiz(bot)
 setup_menu(bot)
+setup_rpg(bot)
 
 
 # =========================
@@ -104,6 +106,7 @@ async def on_ready():
     print("Moderation system aktif.")
     print("Game system terdaftar.")
     print("Quiz system terdaftar.")
+    print("RPG system terdaftar.")
 
     if LOG_CHANNEL_ID:
         print(f"Mod Log dikonfigurasi: {LOG_CHANNEL_ID}")
