@@ -935,8 +935,118 @@ class PartyInviteView(discord.ui.View):
         self.stop()
         await interaction.response.edit_message(content="Undangan party ditolak.", view=None)
 
+
+class RPGMainMenuView(discord.ui.View):
+    """Interactive main navigation for Fumi RPG."""
+    def __init__(self, owner: discord.abc.User):
+        super().__init__(timeout=300)
+        self.owner_id = owner.id
+        self.owner_name = owner.display_name
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Menu ini dibuka oleh pemain lain. Ketik `!menurpg` untuk membuka menu milikmu.", ephemeral=True)
+            return False
+        return True
+
+    async def show_page(self, interaction: discord.Interaction, page: str):
+        user = interaction.user
+        if page == "home":
+            embed = self.home_embed(user)
+            await interaction.response.edit_message(embed=embed, view=self)
+        elif page == "profile":
+            p = ensure_player(user.id, str(user))
+            chars = get_characters(user.id)
+            embed = discord.Embed(title=f"👤 Profil RPG — {user.display_name}", color=discord.Color.dark_purple())
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.add_field(name="Level / EXP", value=f"{p[2]} · {p[3]}/{p[2]*100}", inline=True)
+            embed.add_field(name="Class", value=p[8], inline=True)
+            embed.add_field(name="Koleksi", value=f"{len(chars)} karakter", inline=True)
+            embed.add_field(name="Statistik", value=f"❤️ HP {p[9]}\n💧 MP {p[10]}\n⚔️ ATK {p[11]}\n🛡️ DEF {p[12]}", inline=True)
+            embed.add_field(name="Mata uang", value=f"🪙 {p[4]} Gold\n💎 {p[5]} Mana\n🔮 {p[6]} Orb\n🌑 {p[7]} Void Seal", inline=True)
+            embed.add_field(name="Rekor", value=f"Menang {p[13]} · Kalah {p[14]}", inline=True)
+            embed.set_footer(text="Fumi RPG • gunakan tombol di bawah untuk navigasi")
+            await interaction.response.edit_message(embed=embed, view=self)
+        elif page == "gacha":
+            view = GachaMenuView(user.id, "coin")
+            await interaction.response.edit_message(content=view.menu_text(), embed=None, view=view)
+        else:
+            pages = {
+                "adventure": ("⚔️ Petualangan", "Pilih tingkat kesulitan dengan perintah:\n`!adventure basic`\n`!adventure hard`\n`!adventure nightmare`\n\nPertarungan akan muncul sebagai pesan interaktif dengan tombol aksi."),
+                "boss": ("🐉 Boss Hunt", "Lihat daftar boss dengan `!fieldbosses` atau `!bosses`.\nMulai pertarungan field boss dengan `!fieldbossfight basic1` (atau `basic2`, `hard1`, `hard2`, `nightmare1`)."),
+                "shop": ("🛒 Black Market", "Lihat equipment yang tersedia dengan `!shop`.\nBeli item dengan `!buy nama item` dan jual item milikmu dengan `!sell ID`."),
+                "inventory": ("🎒 Inventory & Equipment", "Lihat mata uang dengan `!inventory`.\nEquipment: `!equipments`, detail/loadout: `!equipment`.\nPakai `!equip ID` untuk memasang dan `!unequip weapon` atau `!unequip armor` untuk melepas."),
+                "party": ("👥 Party / Co-op", "Undang pemain dengan `!party @anggota`. Pastikan pemain lain menerima undangan untuk bergabung."),
+                "pvp": ("🏆 Shadow Arena — PvP", "Tantang pemain dengan `!pvp @anggota`. Ikuti petunjuk bot untuk menerima atau memulai pertarungan."),
+            }
+            title, description = pages[page]
+            embed = discord.Embed(title=title, description=description, color=discord.Color.dark_purple())
+            embed.set_footer(text="Fumi RPG • pilih halaman lain atau kembali ke menu utama")
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    @staticmethod
+    def home_embed(user):
+        embed = discord.Embed(
+            title="🌑 FUMI RPG — KERAJAAN MALAM",
+            description=(f"Selamat datang, **{user.display_name}**.\n\n"
+                         "*Malam memanggil. Tentukan takdirmu.*\n\n"
+                         "Pilih salah satu menu di bawah untuk membuka fitur RPG."),
+            color=discord.Color.from_rgb(37, 25, 58))
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(name="🧭 Petualangan", value="Dungeon dan monster", inline=True)
+        embed.add_field(name="💎 Summoning", value="Gacha karakter & equipment", inline=True)
+        embed.add_field(name="🐉 Boss Hunt", value="Hadapi field boss dan secret boss", inline=True)
+        embed.add_field(name="🎒 Inventori", value="Item, equipment, dan mata uang", inline=True)
+        embed.add_field(name="🛒 Black Market", value="Beli dan jual equipment", inline=True)
+        embed.add_field(name="⚔️ Multiplayer", value="Party dan PvP", inline=True)
+        embed.set_footer(text="Fumi RPG • menu interaktif • hanya pembuka menu yang dapat menggunakannya")
+        return embed
+
+    @discord.ui.button(label="Profil", emoji="👤", style=discord.ButtonStyle.secondary, row=0)
+    async def profile_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "profile")
+
+    @discord.ui.button(label="Petualangan", emoji="⚔️", style=discord.ButtonStyle.primary, row=0)
+    async def adventure_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "adventure")
+
+    @discord.ui.button(label="Gacha", emoji="💎", style=discord.ButtonStyle.primary, row=0)
+    async def gacha_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "gacha")
+
+    @discord.ui.button(label="Boss Hunt", emoji="🐉", style=discord.ButtonStyle.danger, row=1)
+    async def boss_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "boss")
+
+    @discord.ui.button(label="Shop", emoji="🛒", style=discord.ButtonStyle.secondary, row=1)
+    async def shop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "shop")
+
+    @discord.ui.button(label="Inventory", emoji="🎒", style=discord.ButtonStyle.secondary, row=1)
+    async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "inventory")
+
+    @discord.ui.button(label="Party / Co-op", emoji="👥", style=discord.ButtonStyle.success, row=2)
+    async def party_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "party")
+
+    @discord.ui.button(label="PvP", emoji="🏆", style=discord.ButtonStyle.danger, row=2)
+    async def pvp_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "pvp")
+
+    @discord.ui.button(label="Menu Utama", emoji="🏰", style=discord.ButtonStyle.secondary, row=2)
+    async def home_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.show_page(interaction, "home")
+
 def setup_rpg(bot):
     setup_rpg_database()
+
+    @bot.command(name="menurpg", aliases=["rpggui", "mainrpg"])
+    async def menurpg(ctx):
+        """Buka menu utama interaktif Fumi RPG."""
+        ensure_player(ctx.author.id, str(ctx.author))
+        view = RPGMainMenuView(ctx.author)
+        await rpg_send(ctx, "menu", embed=view.home_embed(ctx.author), view=view)
 
     @bot.group(name="rpg", invoke_without_command=True)
     async def rpg(ctx):
