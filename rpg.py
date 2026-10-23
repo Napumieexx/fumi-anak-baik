@@ -460,6 +460,176 @@ class AdventureView(discord.ui.View):
         await self.update_fight(interaction, "heal")
 
 
+
+class GachaMenuView(discord.ui.View):
+    """Interactive gacha selector: character banners or class-specific equipment."""
+    def __init__(self, author_id, selected_banner="coin"):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.selected_banner = selected_banner if selected_banner in (*BANNERS.keys(), "equipment") else "coin"
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Menu gacha ini milik pemain lain. Ketik `!gacha` untuk membuka menu sendiri.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def menu_text(self):
+        labels = {
+            "coin": "🪙 Common Banner — 100 Gold Coin per tarikan",
+            "mana": "💎 Rare Banner — 1 Mana Crystal per tarikan",
+            "orb": "🔮 Epic Banner — 1 Summoning Orb per tarikan",
+            "void": "🌑 Secret Banner — 1 Void Seal per tarikan",
+            "equipment": f"⚔️ Equipment Banner — {EQUIPMENT_GACHA_COST} Gold Coin per tarikan; pool mengikuti class",
+        }
+        return (
+            "✨ **Fumi RPG · Gacha Hall**\n"
+            "Pilih banner dengan tombol, lalu tekan **Tarik 1×** atau **Tarik 10×**.\n\n"
+            f"**Banner dipilih:**\n{labels[self.selected_banner]}\n\n"
+            "Tarik 10× akan memproses sepuluh hasil sekaligus dan menagih biaya untuk sepuluh tarikan."
+        )
+
+    async def choose(self, interaction, key):
+        self.selected_banner = key
+        await interaction.response.edit_message(content=self.menu_text(), view=self)
+
+    async def draw(self, interaction, pulls):
+        await interaction.response.defer()
+        uid = str(self.author_id)
+        p = ensure_player(self.author_id, str(interaction.user))
+        key = self.selected_banner
+        results = []
+
+        try:
+            with get_connection() as conn:
+                if key == "equipment":
+                    pool = CLASS_EQUIPMENT.get(p[8], [])
+                    if not pool:
+                        await interaction.followup.send("Class kamu belum punya pool equipment.", ephemeral=True)
+                        return
+                    total_cost = EQUIPMENT_GACHA_COST * pulls
+                    balance = conn.execute(
+                        "SELECT gold_coin FROM rpg_players WHERE user_id=?", (uid,)
+                    ).fetchone()
+                    if not balance or balance[0] < total_cost:
+                        await interaction.followup.send(
+                            f"❌ Butuh **{total_cost:,} Gold Coin** untuk {pulls}× equipment gacha.",
+                            ephemeral=True,
+                        )
+                        return
+                    conn.execute(
+                        "UPDATE rpg_players SET gold_coin=gold_coin-? WHERE user_id=?",
+                        (total_cost, uid),
+                    )
+                    for _ in range(pulls):
+                        rarity = random.choices(
+                            [x[0] for x in EQUIPMENT_GACHA_ODDS],
+                            weights=[x[1] for x in EQUIPMENT_GACHA_ODDS],
+                            k=1,
+                        )[0]
+                        item = random.choice([x for x in pool if x[2] == rarity])
+                        name, slot, rarity, atk, hp, defense = item
+                        cur = conn.execute(
+                            """INSERT INTO rpg_equipment_inventory
+                            (user_id,item_name,slot,rarity,atk_bonus,hp_bonus,def_bonus,class_name,bound,source)
+                            VALUES(?,?,?,?,?,?,?,?,0,'gacha')""",
+                            (uid, name, slot, rarity, atk, hp, defense, p[8]),
+                        )
+                        results.append(
+                            f"{'🌟' if rarity == 'Mythic' else '✨' if rarity == 'Epic' else '🔹' if rarity == 'Rare' else '⚪'} "
+                            f"**{name}** [{rarity}] — {slot.title()} · ATK +{atk}, HP +{hp}, DEF +{defense} · ID `{cur.lastrowid}`"
+                        )
+                    title = f"⚔️ Equipment Gacha · {pulls}×"
+                    footer = f"Biaya: {total_cost:,} Gold Coin · Class: {p[8]}"
+                else:
+                    banner = BANNERS[key]
+                    total_cost = banner["cost"] * pulls
+                    balance = conn.execute(
+                        f"SELECT {banner['currency']} FROM rpg_players WHERE user_id=?", (uid,)
+                    ).fetchone()
+                    if not balance or balance[0] < total_cost:
+                        await interaction.followup.send(
+                            f"❌ Butuh **{total_cost:,} {banner['display_currency']}** untuk {pulls}× gacha.",
+                            ephemeral=True,
+                        )
+                        return
+                    conn.execute(
+                        f"UPDATE rpg_players SET {banner['currency']}={banner['currency']}-? WHERE user_id=?",
+                        (total_cost, uid),
+                    )
+                    for _ in range(pulls):
+                        name, role = random.choice(banner["characters"])
+                        old = conn.execute(
+                            "SELECT quantity FROM rpg_characters WHERE user_id=? AND name=?",
+                            (uid, name),
+                        ).fetchone()
+                        duplicate = old is not None
+                        if duplicate:
+                            conn.execute(
+                                "UPDATE rpg_characters SET quantity=quantity+1, shards=shards+10 WHERE user_id=? AND name=?",
+                                (uid, name),
+                            )
+                        else:
+                            conn.execute(
+                                "INSERT INTO rpg_characters(user_id,name,role,rarity) VALUES(?,?,?,?)",
+                                (uid, name, role, banner["rarity"]),
+                            )
+                        conn.execute(
+                            "INSERT INTO rpg_gacha_history(user_id,banner,character_name,rarity) VALUES(?,?,?,?)",
+                            (uid, key, name, banner["rarity"]),
+                        )
+                        duplicate_text = " · Duplikat +10 shards" if duplicate else " · Baru!"
+                        results.append(f"{'🌑' if banner['rarity'] == 'Secret' else '🟣' if banner['rarity'] == 'Epic' else '🔵' if banner['rarity'] == 'Rare' else '⚪'} **{name}** — {role}{duplicate_text}")
+                    title = f"✨ {banner['name']} · {pulls}×"
+                    footer = f"Biaya: {total_cost:,} {banner['display_currency']}"
+
+            embed = discord.Embed(
+                title=title,
+                description="\n".join(f"**{i+1}.** {line}" for i, line in enumerate(results)),
+                color=discord.Color.dark_purple(),
+            )
+            embed.set_footer(text=footer)
+            self.stop()
+            for child in self.children:
+                child.disabled = True
+            await interaction.edit_original_response(content=None, embed=embed, view=self)
+        except Exception as exc:
+            print(f"[Fumi RPG] Gacha menu error: {exc!r}")
+            await interaction.followup.send(
+                "Terjadi error saat gacha diproses. Periksa Console FadeHost.", ephemeral=True
+            )
+
+    @discord.ui.button(label="Common", emoji="🪙", style=discord.ButtonStyle.secondary, row=0)
+    async def common_button(self, interaction, button):
+        await self.choose(interaction, "coin")
+
+    @discord.ui.button(label="Rare", emoji="💎", style=discord.ButtonStyle.primary, row=0)
+    async def rare_button(self, interaction, button):
+        await self.choose(interaction, "mana")
+
+    @discord.ui.button(label="Epic", emoji="🔮", style=discord.ButtonStyle.primary, row=0)
+    async def epic_button(self, interaction, button):
+        await self.choose(interaction, "orb")
+
+    @discord.ui.button(label="Secret", emoji="🌑", style=discord.ButtonStyle.danger, row=0)
+    async def secret_button(self, interaction, button):
+        await self.choose(interaction, "void")
+
+    @discord.ui.button(label="Equipment", emoji="⚔️", style=discord.ButtonStyle.secondary, row=1)
+    async def equipment_button(self, interaction, button):
+        await self.choose(interaction, "equipment")
+
+    @discord.ui.button(label="Tarik 1×", emoji="✨", style=discord.ButtonStyle.success, row=2)
+    async def pull_one_button(self, interaction, button):
+        await self.draw(interaction, 1)
+
+    @discord.ui.button(label="Tarik 10×", emoji="🌟", style=discord.ButtonStyle.success, row=2)
+    async def pull_ten_button(self, interaction, button):
+        await self.draw(interaction, 10)
+
 class FieldBossView(discord.ui.View):
     """Interactive turn-based fight for the five field bosses."""
     def __init__(self, author, boss_key, boss):
@@ -830,37 +1000,14 @@ def setup_rpg(bot):
     @bot.command(name="gacha")
     async def gacha(ctx, banner_key: str = None):
         ensure_player(ctx.author.id, str(ctx.author))
-        if not banner_key or banner_key.lower() not in BANNERS:
-            await rpg_send(ctx, "gacha", content="Banner: `!gacha coin`, `!gacha mana`, `!gacha orb`, `!gacha void`.")
+        # `!gacha` opens the interactive selector. `!gacha coin|mana|orb|void`
+        # remains supported and opens the selector with that banner preselected.
+        key = banner_key.lower() if banner_key else "coin"
+        if key not in (*BANNERS.keys(), "equipment"):
+            await rpg_send(ctx, "gacha", content="Banner tidak dikenal. Ketik `!gacha` untuk membuka menu pilihan.")
             return
-        key = banner_key.lower()
-        b = BANNERS[key]
-        with get_connection() as conn:
-            row = conn.execute(f"SELECT {b['currency']} FROM rpg_players WHERE user_id=?", (str(ctx.author.id),)).fetchone()
-            if not row or row[0] < b["cost"]:
-                await rpg_send(ctx, "gacha", content=f"❌ Butuh {b['cost']} {b['display_currency']}.")
-                return
-            name, role = random.choice(b["characters"])
-            conn.execute(f"UPDATE rpg_players SET {b['currency']}={b['currency']}-? WHERE user_id=?",
-                         (b["cost"], str(ctx.author.id)))
-            old = conn.execute("SELECT quantity FROM rpg_characters WHERE user_id=? AND name=?",
-                               (str(ctx.author.id), name)).fetchone()
-            duplicate = old is not None
-            if duplicate:
-                conn.execute("UPDATE rpg_characters SET quantity=quantity+1, shards=shards+10 WHERE user_id=? AND name=?",
-                             (str(ctx.author.id), name))
-            else:
-                conn.execute("INSERT INTO rpg_characters(user_id,name,role,rarity) VALUES(?,?,?,?)",
-                             (str(ctx.author.id), name, role, b["rarity"]))
-            conn.execute("INSERT INTO rpg_gacha_history(user_id,banner,character_name,rarity) VALUES(?,?,?,?)",
-                         (str(ctx.author.id), key, name, b["rarity"]))
-        emoji = {"Common":"⚪", "Rare":"🔵", "Epic":"🟣", "Secret":"🌑"}[b["rarity"]]
-        await rpg_send(ctx, "gacha", embed=discord.Embed(
-            title=f"{emoji} Gacha Result",
-            description=f"**{name}** · {role} · {b['rarity']}\n" +
-                        ("Duplikat: +10 shards." if duplicate else "Karakter baru ditambahkan."),
-            color=discord.Color.dark_purple()))
-
+        view = GachaMenuView(ctx.author.id, key)
+        await rpg_send(ctx, "gacha", content=view.menu_text(), view=view)
 
     @bot.command(name="equipgacha", aliases=["gachaequip", "equipmentgacha"])
     async def equipgacha(ctx):
