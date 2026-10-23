@@ -13,10 +13,12 @@ class TicTacToe(discord.ui.View):
         self.board = [0] * 9
         self.finished = False
         self.message = None
+        # Gunakan label yang terlihat dan valid sejak papan pertama dikirim.
+        self.update_buttons()
 
     def update_buttons(self):
         for i, button in enumerate(self.children):
-            button.label = MARK[self.board[i]] if self.board[i] else " "
+            button.label = MARK[self.board[i]] if self.board[i] else str(i + 1)
             button.disabled = bool(self.board[i]) or self.finished
 
     def winner(self):
@@ -149,6 +151,163 @@ class RPSView(discord.ui.View):
             try:
                 await self.message.edit(
                     content="⌛ Waktu memilih suit habis. Jalankan `!rps` untuk ronde baru.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+
+class FriendRPSInviteView(discord.ui.View):
+    """Invitation flow for player-vs-player rock-paper-scissors."""
+    def __init__(self, challenger, opponent):
+        super().__init__(timeout=30)
+        self.challenger = challenger
+        self.opponent = opponent
+        self.message = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message(
+                "Undangan ini bukan untukmu.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Terima", emoji="✅", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        game = FriendRPSView(self.challenger, self.opponent)
+        await interaction.response.edit_message(
+            content=(
+                f"✊ **Suit Versus Teman**\n"
+                f"{self.challenger.mention} vs {self.opponent.mention}\n"
+                "Undangan diterima! Kedua pemain, pilih Batu, Gunting, atau Kertas "
+                "menggunakan tombol di bawah."
+            ),
+            view=self,
+        )
+        game.message = await interaction.channel.send(
+            f"🎮 **Ronde suit dimulai!**\n"
+            f"{self.challenger.mention} vs {self.opponent.mention}\n"
+            "Pilihan masing-masing pemain dirahasiakan sampai keduanya memilih.",
+            view=game,
+        )
+
+    @discord.ui.button(label="Tolak", emoji="✖️", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"❌ {self.opponent.mention} menolak tantangan suit.",
+            view=self,
+        )
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="⌛ Undangan suit kedaluwarsa.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+
+class FriendRPSView(discord.ui.View):
+    """Both players select privately; reveal result only after both choose."""
+    def __init__(self, challenger, opponent):
+        super().__init__(timeout=60)
+        self.players = {challenger.id: challenger, opponent.id: opponent}
+        self.choices = {}
+        self.message = None
+        self.finished = False
+
+    async def choose(self, interaction: discord.Interaction, choice: str):
+        if self.finished:
+            await interaction.response.send_message(
+                "Ronde ini sudah selesai.", ephemeral=True
+            )
+            return
+        if interaction.user.id not in self.players:
+            await interaction.response.send_message(
+                "Kamu bukan pemain di ronde ini.", ephemeral=True
+            )
+            return
+        if interaction.user.id in self.choices:
+            await interaction.response.send_message(
+                "Pilihanmu sudah tersimpan.", ephemeral=True
+            )
+            return
+
+        self.choices[interaction.user.id] = choice
+        await interaction.response.send_message(
+            "Pilihanmu sudah tersimpan. Menunggu pemain lain...",
+            ephemeral=True,
+        )
+        if len(self.choices) == 2:
+            await self.finish_round()
+
+    async def finish_round(self):
+        if self.finished:
+            return
+        self.finished = True
+        for item in self.children:
+            item.disabled = True
+
+        ids = list(self.players.keys())
+        first, second = ids[0], ids[1]
+        choice1, choice2 = self.choices[first], self.choices[second]
+        wins = {
+            ("batu", "gunting"),
+            ("gunting", "kertas"),
+            ("kertas", "batu"),
+        }
+        if choice1 == choice2:
+            result = "🤝 Hasilnya seri!"
+        elif (choice1, choice2) in wins:
+            result = f"🏆 {self.players[first].mention} menang!"
+        else:
+            result = f"🏆 {self.players[second].mention} menang!"
+
+        if self.message:
+            try:
+                await self.message.edit(
+                    content=(
+                        f"✊ **Hasil Suit Versus**\n"
+                        f"{self.players[first].mention} memilih **{choice1.title()}**.\n"
+                        f"{self.players[second].mention} memilih **{choice2.title()}**.\n\n"
+                        f"{result}"
+                    ),
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="🪨 Batu", style=discord.ButtonStyle.primary, row=0)
+    async def batu(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.choose(interaction, "batu")
+
+    @discord.ui.button(label="✂️ Gunting", style=discord.ButtonStyle.primary, row=0)
+    async def gunting(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.choose(interaction, "gunting")
+
+    @discord.ui.button(label="📄 Kertas", style=discord.ButtonStyle.primary, row=0)
+    async def kertas(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.choose(interaction, "kertas")
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="⌛ Waktu memilih habis. Jalankan `!rps @teman` untuk ronde baru.",
                     view=self,
                 )
             except discord.HTTPException:
@@ -298,10 +457,24 @@ def setup_games(bot):
         )
 
     @bot.command(name="rps", aliases=["suit"])
-    async def rps(ctx):
-        view = RPSView(ctx.author)
-        await ctx.send(
-            f"✊ **Suit melawan Fumi!** {ctx.author.mention}, pilih tombolmu di bawah.",
+    async def rps(ctx, opponent: discord.Member = None):
+        if opponent is None:
+            view = RPSView(ctx.author)
+            view.message = await ctx.send(
+                f"✊ **Suit melawan Fumi!** {ctx.author.mention}, pilih tombolmu di bawah.",
+                view=view,
+            )
+            return
+
+        if opponent.bot or opponent.id == ctx.author.id:
+            await ctx.send("Pilih anggota lain, bukan dirimu sendiri atau bot.")
+            return
+
+        view = FriendRPSInviteView(ctx.author, opponent)
+        view.message = await ctx.send(
+            f"✊ **Tantangan Suit!**\n"
+            f"{ctx.author.mention} menantang {opponent.mention} bermain suit.\n"
+            f"{opponent.mention}, terima atau tolak tantangan ini.",
             view=view,
         )
 
@@ -320,7 +493,7 @@ def setup_games(bot):
         await ctx.send(
             "**Minigames Fumi**\n"
             "`!ttt @teman` — tic-tac-toe dengan tombol\n"
-            "`!rps` — suit dengan tombol batu/gunting/kertas\n"
+            "`!rps` — suit melawan Fumi\n`!rps @teman` — tantang teman bermain suit\n"
             "`!tebakangka` — tebak angka 1–24 dengan tombol\n"
             "Game berakhir jika tebakan benar atau waktu habis."
         )
