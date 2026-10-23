@@ -142,6 +142,7 @@ if any(phrase in text_lower for phrase in animal_context):
     ]
 
 if detected:
+    
         # =========================
         # HITUNG SCORE
         # =========================
