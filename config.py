@@ -1,4 +1,4 @@
-FUZZY_THRESHOLD = 97
+FUZZY_THRESHOLD = 90
 
 # False = kata yang sama dalam 1 pesan hanya dihitung sekali
 # True  = setiap pengulangan kata ikut dihitung
