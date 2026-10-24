@@ -57,7 +57,7 @@ def detect_words(text):
         if result:
             matched_word, similarity, _ = result
 
-            if similarity >= 95:
+            if similarity >= 90:
                 detected.append({
                     "word": raw_word,
                     "matched": matched_word,
