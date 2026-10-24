@@ -22,6 +22,10 @@ RPG_CHANNELS = {
     "pvp": "pvp-arena",
 }
 
+# In-memory party sessions; parties reset when the bot restarts.
+ACTIVE_PARTIES = {}
+
+
 DIFFICULTIES = {
     "basic": {"hp": 1.0, "atk": 1.0, "reward": 1.0, "label": "Basic"},
     "hard": {"hp": 2.5, "atk": 1.8, "reward": 2.0, "label": "Hard"},
@@ -911,6 +915,207 @@ class SecretBossView(discord.ui.View):
     @discord.ui.button(label="Bertahan/Pulih", style=discord.ButtonStyle.success, emoji="🛡️")
     async def guard_button(self, interaction, button): await self.act(interaction, "guard")
 
+class PvPBattleView(discord.ui.View):
+    """Interactive turn-based PvP duel. Only the player whose turn it is may act."""
+    def __init__(self, challenger, opponent):
+        super().__init__(timeout=600)
+        self.players = [challenger, opponent]
+        self.turn = 0
+        self.finished = False
+        self.locked = False
+        self.state = {}
+        for member in self.players:
+            ensure_player(member.id, str(member))
+            p = ensure_player(member.id, str(member))
+            ga, gh, gd = equipment_stats(member.id)
+            self.state[member.id] = {"member": member, "hp": p[9]+gh, "max_hp": p[9]+gh,
+                                     "mp": p[10], "max_mp": p[10], "atk": p[11]+ga,
+                                     "def": p[12]+gd, "level": p[2]}
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id not in self.state:
+            await interaction.response.send_message("Kamu bukan peserta duel ini.", ephemeral=True)
+            return False
+        if self.finished:
+            await interaction.response.send_message("Duel sudah selesai.", ephemeral=True)
+            return False
+        if interaction.user.id != self.players[self.turn].id:
+            await interaction.response.send_message(f"Sekarang giliran {self.players[self.turn].mention}.", ephemeral=True)
+            return False
+        if self.locked:
+            await interaction.response.send_message("Aksi sebelumnya sedang diproses.", ephemeral=True)
+            return False
+        return True
+
+    def status(self, note=""):
+        lines=[]
+        for m in self.players:
+            d=self.state[m.id]
+            lines.append(f"{m.mention} — ❤️ **{max(0,d['hp']):,}/{d['max_hp']:,}** · 💧 {d['mp']}/{d['max_mp']}")
+        return ("⚔️ **Fumi RPG · PvP Arena**\n"+"\n".join(lines)+
+                f"\n\nGiliran: {self.players[self.turn].mention}\n{note}")
+
+    async def act(self, interaction, action):
+        self.locked=True
+        try:
+            actor=self.players[self.turn]
+            target=self.players[1-self.turn]
+            a=self.state[actor.id]; t=self.state[target.id]
+            if action=="skill" and a["mp"]<15:
+                await interaction.response.send_message("MP tidak cukup; skill memerlukan 15 MP.",ephemeral=True)
+                return
+            await interaction.response.defer()
+            if action=="skill":
+                a["mp"]-=15
+                damage=max(1,int(a["atk"]*(1.8+a["level"]*0.03)-t["def"]*0.35))
+                t["hp"]-=damage
+                note=f"✨ {actor.mention} memakai skill dan menghasilkan **{damage:,} damage**."
+            elif action=="guard":
+                heal=max(10,a["def"]*2)
+                a["hp"]=min(a["max_hp"],a["hp"]+heal)
+                note=f"🛡️ {actor.mention} memulihkan **{heal:,} HP**."
+            else:
+                damage=max(1,int(a["atk"]+a["level"]*2-t["def"]*0.25))
+                t["hp"]-=damage
+                note=f"⚔️ {actor.mention} menyerang dan menghasilkan **{damage:,} damage**."
+            if t["hp"]<=0:
+                t["hp"]=0; self.finished=True; self.stop()
+                with get_connection() as conn:
+                    conn.execute("UPDATE rpg_players SET wins=wins+1 WHERE user_id=?",(str(actor.id),))
+                    conn.execute("UPDATE rpg_players SET losses=losses+1 WHERE user_id=?",(str(target.id),))
+                for child in self.children: child.disabled=True
+                note+=f"\n🏆 **{actor.display_name} menang!**"
+            else:
+                self.turn=1-self.turn
+            await interaction.edit_original_response(content=self.status(note),view=self)
+        except Exception as exc:
+            print(f"[Fumi RPG] PvP action error: {exc!r}")
+            try: await interaction.followup.send("Error saat memproses duel. Admin bisa memeriksa console.",ephemeral=True)
+            except discord.HTTPException: pass
+        finally:
+            self.locked=False
+
+    @discord.ui.button(label="Serang",style=discord.ButtonStyle.primary,emoji="⚔️")
+    async def attack(self,interaction,button): await self.act(interaction,"attack")
+    @discord.ui.button(label="Skill (15 MP)",style=discord.ButtonStyle.danger,emoji="✨")
+    async def skill(self,interaction,button): await self.act(interaction,"skill")
+    @discord.ui.button(label="Bertahan/Pulih",style=discord.ButtonStyle.success,emoji="🛡️")
+    async def guard(self,interaction,button): await self.act(interaction,"guard")
+
+
+class PvPInviteView(discord.ui.View):
+    def __init__(self, challenger, opponent):
+        super().__init__(timeout=90)
+        self.challenger=challenger; self.opponent=opponent
+
+    @discord.ui.button(label="Terima Duel",style=discord.ButtonStyle.success,emoji="⚔️")
+    async def accept(self,interaction,button):
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message("Tantangan ini bukan untukmu.",ephemeral=True); return
+        view=PvPBattleView(self.challenger,self.opponent)
+        for child in self.children: child.disabled=True
+        await interaction.response.edit_message(content=view.status("Duel dimulai! Gunakan tombol saat giliranmu."),view=view)
+
+    @discord.ui.button(label="Tolak",style=discord.ButtonStyle.secondary)
+    async def decline(self,interaction,button):
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message("Tantangan ini bukan untukmu.",ephemeral=True); return
+        for child in self.children: child.disabled=True
+        await interaction.response.edit_message(content=f"{self.opponent.mention} menolak tantangan PvP.",view=self)
+        self.stop()
+
+
+class CoopAdventureView(discord.ui.View):
+    """Shared-monster co-op adventure with individual player HP/MP."""
+    def __init__(self, members, monster, difficulty):
+        super().__init__(timeout=600)
+        self.members=list(members); self.monster=monster.copy(); self.difficulty=difficulty
+        self.monster_max_hp=self.monster["hp"]
+        self.finished=False; self.locked=False
+        self.state={}
+        for m in self.members:
+            p=ensure_player(m.id,str(m)); ga,gh,gd=equipment_stats(m.id)
+            self.state[m.id]={"member":m,"hp":p[9]+gh,"max_hp":p[9]+gh,"mp":p[10],"max_mp":p[10],
+                              "atk":p[11]+ga,"def":p[12]+gd,"level":p[2]}
+
+    async def interaction_check(self,interaction):
+        if interaction.user.id not in self.state:
+            await interaction.response.send_message("Kamu bukan anggota party ini.",ephemeral=True); return False
+        if self.finished:
+            await interaction.response.send_message("Petualangan sudah selesai.",ephemeral=True); return False
+        if self.locked:
+            await interaction.response.send_message("Aksi sedang diproses.",ephemeral=True); return False
+        if self.state[interaction.user.id]["hp"]<=0:
+            await interaction.response.send_message("Karakter kamu sudah tumbang.",ephemeral=True); return False
+        return True
+
+    def status(self,note=""):
+        people="\n".join(f"{d['member'].mention}: ❤️ {max(0,d['hp']):,}/{d['max_hp']:,} · 💧 {d['mp']}/{d['max_mp']}" for d in self.state.values())
+        return f"👥 **Party Adventure — {self.difficulty.title()}**\n👹 **{self.monster['name']}** HP {max(0,self.monster['hp']):,}/{self.monster_max_hp:,}\n{people}\n{note}"
+
+    async def act(self,interaction,action):
+        self.locked=True
+        try:
+            d=self.state[interaction.user.id]
+            if action=="skill" and d["mp"]<15:
+                await interaction.response.send_message("MP tidak cukup; skill memerlukan 15 MP.",ephemeral=True); return
+            await interaction.response.defer()
+            if action=="skill":
+                d["mp"]-=15; damage=max(1,int(d["atk"]*(2+d["level"]*.04)-self.monster["def"]*.35))
+            elif action=="guard":
+                d["hp"]=min(d["max_hp"],d["hp"]+max(10,d["def"]*2)); damage=0
+            else: damage=max(1,int(d["atk"]+d["level"]*2-self.monster["def"]*.25))
+            self.monster["hp"]-=damage
+            note=f"{interaction.user.mention} melakukan **{action}**, damage **{damage:,}**."
+            if self.monster["hp"]<=0:
+                self.finished=True; self.stop()
+                for child in self.children: child.disabled=True
+                winners=[x for x in self.state.values() if x["hp"]>0]
+                for x in winners:
+                    uid=x["member"].id; gain_exp(uid,self.monster["exp"]); ensure_player(uid,str(x["member"]))
+                    with get_connection() as conn:
+                        conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+?,wins=wins+1 WHERE user_id=?",(self.monster["gold"],str(uid)))
+                note+=f"\n🏆 Musuh dikalahkan! Setiap anggota yang bertahan mendapat **{self.monster['exp']} EXP** dan **{self.monster['gold']} Gold**."
+                if isinstance(self, CoopFieldBossView):
+                    drop_name=None
+                    if random.random() < self.monster["chance"]:
+                        drop_name=self.monster["drop"]
+                        data=LIMITED_EQUIPMENT[drop_name]
+                        for x in winners:
+                            add_equipment(x["member"].id,(drop_name,*data),"Any",1,"field_boss")
+                    note += (f"\n🎁 Limited drop **{drop_name}** diberikan kepada anggota yang bertahan (Bound)." if drop_name else f"\nDrop Limited tidak jatuh kali ini ({int(self.monster['chance']*100)}% peluang).")
+            else:
+                incoming=max(1,int(self.monster["atk"]-d["def"]*.4))
+                if action=="guard": incoming=max(1,incoming//2)
+                d["hp"]-=incoming; note+=f" Monster membalas **{incoming:,} damage**."
+                if d["hp"]<=0:
+                    d["hp"]=0
+                    with get_connection() as conn: conn.execute("UPDATE rpg_players SET losses=losses+1 WHERE user_id=?",(str(interaction.user.id),))
+                if not any(x["hp"]>0 for x in self.state.values()):
+                    self.finished=True; self.stop()
+                    for child in self.children: child.disabled=True
+                    note+="\n💀 Seluruh party tumbang."
+            await interaction.edit_original_response(content=self.status(note),view=self)
+        except Exception as exc:
+            print(f"[Fumi RPG] Co-op adventure error: {exc!r}")
+            try: await interaction.followup.send("Error saat memproses co-op. Periksa console bot.",ephemeral=True)
+            except discord.HTTPException: pass
+        finally: self.locked=False
+    @discord.ui.button(label="Serang",style=discord.ButtonStyle.primary,emoji="⚔️")
+    async def attack(self,interaction,button): await self.act(interaction,"attack")
+    @discord.ui.button(label="Skill (15 MP)",style=discord.ButtonStyle.danger,emoji="✨")
+    async def skill(self,interaction,button): await self.act(interaction,"skill")
+    @discord.ui.button(label="Bertahan/Pulih",style=discord.ButtonStyle.success,emoji="🛡️")
+    async def guard(self,interaction,button): await self.act(interaction,"guard")
+
+
+class CoopFieldBossView(CoopAdventureView):
+    """Co-op battle against a configured field boss; limited drops remain bound."""
+    def __init__(self,members,boss_key,boss):
+        super().__init__(members,boss,boss["difficulty"].lower())
+        self.boss_key=boss_key
+
+
 class PartyInviteView(discord.ui.View):
     def __init__(self, leader, invited):
         super().__init__(timeout=60)
@@ -924,8 +1129,13 @@ class PartyInviteView(discord.ui.View):
             await interaction.response.send_message("Undangan ini bukan untukmu.", ephemeral=True)
             return
         self.accepted = True
+        party = list(dict.fromkeys(ACTIVE_PARTIES.get(self.leader_id, []) + [self.leader_id, self.invited_id]))
+        ACTIVE_PARTIES[self.leader_id] = party
+        ACTIVE_PARTIES[self.invited_id] = party
+        for uid in party:
+            ACTIVE_PARTIES[uid] = party
         self.stop()
-        await interaction.response.edit_message(content=f"🤝 {interaction.user.mention} menerima undangan party. (Pencatatan party belum disimpan permanen.)", view=None)
+        await interaction.response.edit_message(content=f"🤝 Party aktif: <@{self.leader_id}> dan <@{self.invited_id}>. Pemimpin dapat menjalankan `!adventure basic`, `!adventure hard`, `!adventure nightmare`, atau `!fieldbossfight basic1 party`.", view=None)
 
     @discord.ui.button(label="Tolak", style=discord.ButtonStyle.secondary)
     async def decline(self, interaction, button):
@@ -976,8 +1186,8 @@ class RPGMainMenuView(discord.ui.View):
                 "boss": ("🐉 Boss Hunt", "Lihat daftar boss dengan `!fieldbosses` atau `!bosses`.\nMulai pertarungan field boss dengan `!fieldbossfight basic1` (atau `basic2`, `hard1`, `hard2`, `nightmare1`)."),
                 "shop": ("🛒 Black Market", "Lihat equipment yang tersedia dengan `!shop`.\nBeli item dengan `!buy nama item` dan jual item milikmu dengan `!sell ID`."),
                 "inventory": ("🎒 Inventory & Equipment", "Lihat mata uang dengan `!inventory`.\nEquipment: `!equipments`, detail/loadout: `!equipment`.\nPakai `!equip ID` untuk memasang dan `!unequip weapon` atau `!unequip armor` untuk melepas."),
-                "party": ("👥 Party / Co-op", "Undang pemain dengan `!party @anggota`. Pastikan pemain lain menerima undangan untuk bergabung."),
-                "pvp": ("🏆 Shadow Arena — PvP", "Tantang pemain dengan `!pvp @anggota`. Ikuti petunjuk bot untuk menerima atau memulai pertarungan."),
+                "party": ("👥 Party / Co-op", "Undang pemain dengan `!party @anggota`, lalu jalankan `!adventure basic|hard|nightmare` atau `!fieldbossfight basic1 party @anggota`."),
+                "pvp": ("🏆 Shadow Arena — PvP", "Tantang pemain dengan `!pvp @anggota`; setelah diterima, duel berjalan dengan tombol Serang, Skill, dan Bertahan."),
             }
             title, description = pages[page]
             embed = discord.Embed(title=title, description=description, color=discord.Color.dark_purple())
@@ -1236,6 +1446,40 @@ def setup_rpg(bot):
             conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+? WHERE user_id=?",(price,str(ctx.author.id)))
         await rpg_send(ctx,"menu",content=f"💰 **{item[0]}** terjual seharga {price} Gold.")
 
+    @bot.command(name="sellall", aliases=["sell-all", "sellallequipments", "sellallitems"])
+    async def sellall(ctx):
+        """Sell every eligible unused equipment; limited/bound/equipped gear is protected."""
+        ensure_player(ctx.author.id, str(ctx.author))
+        uid = str(ctx.author.id)
+        with get_connection() as conn:
+            rows = conn.execute("""SELECT id,item_name,rarity,bound FROM rpg_equipment_inventory
+                WHERE user_id=? ORDER BY id""", (uid,)).fetchall()
+            equipped = {r[0] for r in conn.execute(
+                "SELECT item_id FROM rpg_equipment_loadout WHERE user_id=? AND item_id IS NOT NULL", (uid,)
+            ).fetchall()}
+            eligible=[]; protected_limited=0; protected_equipped=0
+            for item_id,name,rarity,bound in rows:
+                if bound or rarity.casefold()=="limited":
+                    protected_limited += 1
+                    continue
+                if item_id in equipped:
+                    protected_equipped += 1
+                    continue
+                price=max(25,int(EQUIPMENT_SHOP.get(name,100)*0.45))
+                eligible.append((item_id,name,price))
+            if not eligible:
+                await rpg_send(ctx,"menu",content=("Tidak ada equipment yang bisa dijual. "
+                    f"Dilindungi: {protected_limited} Limited/Bound, {protected_equipped} sedang dipakai."))
+                return
+            total=sum(x[2] for x in eligible)
+            conn.executemany("DELETE FROM rpg_equipment_inventory WHERE id=? AND user_id=?",
+                             [(x[0],uid) for x in eligible])
+            conn.execute("UPDATE rpg_players SET gold_coin=gold_coin+? WHERE user_id=?",(total,uid))
+        names=', '.join(f"{name} (ID {item_id})" for item_id,name,_ in eligible[:12])
+        if len(eligible)>12: names += f" dan {len(eligible)-12} equipment lainnya"
+        await rpg_send(ctx,"menu",content=(f"💰 **Sell All berhasil!** Terjual **{len(eligible)} equipment** untuk **{total:,} Gold Coin**.\n"
+            f"{names}\n🔒 Tidak dijual: {protected_limited} Limited/Bound dan {protected_equipped} equipment yang sedang dipakai."))
+
     @bot.command(name="trade")
     async def trade(ctx,member:discord.Member,item_id:int,gold_amount:int=0):
         ensure_player(ctx.author.id,str(ctx.author)); ensure_player(member.id,str(member))
@@ -1345,13 +1589,21 @@ def setup_rpg(bot):
         choices = MONSTER_BY_DIFFICULTY[difficulty_name]
         key = random.choice(choices)
         monster = scaled_monster(key, difficulty_name)
-        view = AdventureView(ctx.author, monster, difficulty_name)
-        await view.start()
-        await rpg_send(ctx, "adventure",
-                       content=f"⚔️ **{monster['name']}** muncul!\nKesulitan: **{difficulty_name.title()}**\n"
-                               f"Monster HP: **{monster['hp']}** · ATK: **{monster['atk']}**\n"
-                               f"HP kamu: **{view.hp}/{view.max_hp}** · MP: **{view.mp}/{view.max_mp}**",
-                       view=view)
+        party_ids = ACTIVE_PARTIES.get(ctx.author.id, [ctx.author.id])
+        members = [ctx.guild.get_member(uid) for uid in party_ids] if ctx.guild else [ctx.author]
+        members = [m for m in members if m is not None and not m.bot]
+        if ctx.author not in members: members.insert(0, ctx.author)
+        if len(members) > 1:
+            view = CoopAdventureView(members, monster, difficulty_name)
+            await rpg_send(ctx, "adventure", content=view.status("Party adventure dimulai! Semua anggota dapat memakai tombol aksi."), view=view)
+        else:
+            view = AdventureView(ctx.author, monster, difficulty_name)
+            await view.start()
+            await rpg_send(ctx, "adventure",
+                           content=f"⚔️ **{monster['name']}** muncul!\nKesulitan: **{difficulty_name.title()}**\n"
+                                   f"Monster HP: **{monster['hp']}** · ATK: **{monster['atk']}**\n"
+                                   f"HP kamu: **{view.hp}/{view.max_hp}** · MP: **{view.mp}/{view.max_mp}**",
+                           view=view)
 
 
     @bot.command(name="fieldbosses", aliases=["fieldboss"])
@@ -1360,19 +1612,29 @@ def setup_rpg(bot):
         await rpg_send(ctx,"boss",content="**👹 Field Bosses**\n"+"\n\n".join(lines)+"\n\nLawan dengan `!fieldbossfight <key>`.")
 
     @bot.command(name="fieldbossfight", aliases=["fboss"])
-    async def fieldbossfight(ctx, boss_key: str = None):
+    async def fieldbossfight(ctx, boss_key: str = None, mode: str = "solo", member1: discord.Member = None, member2: discord.Member = None, member3: discord.Member = None):
         ensure_player(ctx.author.id, str(ctx.author))
         if not boss_key or boss_key.lower() not in FIELD_BOSSES:
-            await rpg_send(ctx, "boss", content="Gunakan `!fieldbosses`, lalu `!fieldbossfight basic1` (basic2, hard1, hard2, nightmare1).")
+            await rpg_send(ctx, "boss", content="Gunakan `!fieldbossfight basic1` untuk solo atau `!fieldbossfight basic1 party @anggota [@anggota2] [@anggota3]`. Boss: basic1, basic2, hard1, hard2, nightmare1.")
             return
-        key = boss_key.lower()
-        boss = FIELD_BOSSES[key]
-        view = FieldBossView(ctx.author, key, boss)
-        await rpg_send(
-            ctx, "boss",
-            content=view.status_text("Pilih aksi di bawah untuk memulai pertarungan."),
-            view=view
-        )
+        key = boss_key.lower(); boss = FIELD_BOSSES[key]
+        mode=mode.lower()
+        members=[ctx.author]
+        if mode in ("party","coop","co-op"):
+            members += [m for m in (member1,member2,member3) if m and not m.bot and m.id != ctx.author.id]
+            if len(members)==1:
+                party_ids=ACTIVE_PARTIES.get(ctx.author.id,[])
+                if ctx.guild: members += [ctx.guild.get_member(uid) for uid in party_ids if uid != ctx.author.id and ctx.guild.get_member(uid)]
+            members=list({m.id:m for m in members}.values())
+            if len(members)<2:
+                await rpg_send(ctx,"boss",content="Co-op perlu anggota lain. Gunakan `!fieldbossfight basic1 party @anggota` atau undang dengan `!party @anggota` terlebih dahulu.")
+                return
+            for m in members: ensure_player(m.id,str(m))
+            view=CoopFieldBossView(members,key,boss)
+            await rpg_send(ctx,"boss",content=view.status("Co-op Field Boss dimulai! Semua peserta dapat menggunakan tombol."),view=view)
+        else:
+            view = FieldBossView(ctx.author, key, boss)
+            await rpg_send(ctx, "boss", content=view.status_text("Pilih aksi di bawah untuk memulai pertarungan."), view=view)
 
     @bot.command(name="bosses", aliases=["secretboss"])
     async def bosses(ctx):
@@ -1460,16 +1722,16 @@ def setup_rpg(bot):
         if member is None or member.bot or member.id == ctx.author.id:
             await rpg_send(ctx, "pvp", content="Gunakan `!pvp @anggota` untuk menantang pemain lain.")
             return
-        await rpg_send(ctx, "pvp", content=(
-            f"⚔️ {ctx.author.mention} menantang {member.mention}.\n"
-            "Arena dan matchmaking ini belum mengubah statistik atau rating; sistem duel belum aktif."))
+        ensure_player(ctx.author.id,str(ctx.author)); ensure_player(member.id,str(member))
+        view=PvPInviteView(ctx.author,member)
+        await rpg_send(ctx,"pvp",content=f"⚔️ {ctx.author.mention} menantang {member.mention} ke duel PvP! {member.mention}, pilih Terima Duel atau Tolak.",view=view)
 
     @bot.command(name="rpgstatus")
     async def rpgstatus(ctx):
         await rpg_send(ctx, "menu", content=(
             "Fumi RPG module aktif: profil, statistik dasar, class pilihan, daily, gacha, koleksi, "
             "petualangan monster berbasis tombol, kesulitan dan info Secret Boss.\n"
-            "Secret Boss solo/co-op, drop inventory, dan trial penukaran role aktif. Duel PvP belum aktif."))
+            "Secret Boss solo/co-op, drop inventory, dan trial penukaran role aktif. PvP interaktif, party adventure, dan co-op field boss tersedia."))
 
 
     # Secret admin commands: deliberately omitted from public RPG help/menu.
