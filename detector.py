@@ -14,7 +14,7 @@ LEET = str.maketrans("4@3105$7", "aaeiosst")
 SUFFIXES = ("nya", "ku", "mu", "in", "an", "kan", "lah")
 MIN_STEM = 3          # sisa kata minimal setelah imbuhan dibuang
 MIN_FUZZY_LEN = 6     # kata < 6 huruf hanya boleh exact match
-DEFAULT_SAFE = {"kontrol", "bangsa", "bangsal", "anjung"}
+DEFAULT_SAFE = {"kontrol", "bangsa", "bangsal", "anjung", "lanjut", "pantes"}
 
 MENTION_OR_URL = re.compile(r"<a?[@#:][^>]*>|https?://\S+")
 REPEATS = re.compile(r"(.)\1+")          # aaa  -> a
