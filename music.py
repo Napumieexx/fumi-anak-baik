@@ -279,7 +279,7 @@ class Music(commands.Cog):
         timeout = aiohttp.ClientTimeout(total=20)
         # mp32 adalah MP3 VBR berkualitas lebih baik. Format lain menjadi fallback
         # jika suatu track tidak menyediakan URL audio pada format tersebut.
-        audio_formats = ("mp31",)
+        audio_formats = ("mp32", "mp31", "ogg", "flac")
         last_error = None
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -436,13 +436,24 @@ class Music(commands.Cog):
         return None
 
     async def search_multi_source(self, query: str) -> Track | None:
-        """Tes sumber sementara: gunakan Internet Archive saja, tanpa fallback Jamendo."""
+        """Cari berurutan di katalog yang menyediakan URL audio dan lisensi."""
+        errors = []
+        try:
+            track = await self.search_jamendo(query)
+            if track:
+                return track
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
+            errors.append(f"Jamendo: {error}")
+
         try:
             track = await self.search_internet_archive(query)
             if track:
                 return track
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
-            print(f"Fumi Internet Archive test search error: {error}")
+            errors.append(f"Internet Archive: {error}")
+
+        if errors:
+            print("Fumi multi-source search: " + " | ".join(errors))
         return None
 
     async def spotify_oembed_title(self, url: str) -> str | None:
@@ -703,7 +714,7 @@ class Music(commands.Cog):
             )
             await self.lookup_track_metadata(track)
         else:
-            status = await ctx.send(f"🔎 Tes sumber: mencari **{discord.utils.escape_markdown(query)}** di Internet Archive saja...")
+            status = await ctx.send(f"🔎 Mencari **{discord.utils.escape_markdown(query)}** di beberapa katalog audio...")
             try:
                 track = await self.search_multi_source(query)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
@@ -920,7 +931,7 @@ class Music(commands.Cog):
         embed = discord.Embed(title="🎵 FUMI MUSIC — HELP", color=PLAYER_COLOR)
         embed.add_field(
             name="Pemutaran",
-            value=("`!p <judul lagu>` — Tes sementara: cari di Internet Archive saja\n"
+            value=("`!p <judul lagu>` — Cari di Jamendo dan Internet Archive\n"
                    "`!p <link track Jamendo>` — Putar track Jamendo\n"
                    "`!p <URL audio langsung>` — Putar stream yang diizinkan\n"
                    "`!queue` — Lihat antrean\n`!leave` — Keluar dari voice channel"),
@@ -937,7 +948,7 @@ class Music(commands.Cog):
             value="Jamendo track URL dan URL audio langsung. Spotify digunakan untuk metadata lalu dicari di katalog berlisensi; audio Spotify/YouTube tidak diambil langsung.",
             inline=False,
         )
-        embed.set_footer(text="High Quality • Tes Internet Archive + URL audio langsung yang diizinkan")
+        embed.set_footer(text="High Quality • Jamendo + URL audio langsung yang diizinkan")
         await ctx.send(embed=embed)
 
     @commands.Cog.listener()
