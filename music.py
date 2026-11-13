@@ -19,7 +19,7 @@ from discord.ext import commands
 
 
 # Fumi Music - High Quality player
-# Metadata discovery: iTunes, MusicBrainz, Deezer. Licensed playback: Jamendo / Internet Archive.
+# Metadata discovery: iTunes, MusicBrainz, Deezer. Playback discovery: Jamendo, Internet Archive, Audius, optional official SoundCloud API.
 # Spotify/YouTube page URLs are not extracted or ripped; metadata is never treated as an audio license.
 
 PLAYER_COLOR = discord.Color.from_rgb(35, 190, 120)
@@ -72,6 +72,7 @@ class Track:
     artist: str | None = None
     license_url: str | None = None
     source: str = "Direct audio"
+    fallback_tracks: list["Track"] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -192,6 +193,15 @@ class Music(commands.Cog):
         self.players: dict[int, GuildPlayer] = defaultdict(GuildPlayer)
         self.progress_task: asyncio.Task | None = None
         self.jamendo_client_id = os.getenv("JAMENDO_CLIENT_ID")
+        self.audius_api_key = os.getenv("AUDIUS_API_KEY")
+        self.spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID")
+        self.spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+        self._spotify_token: str | None = None
+        self._spotify_token_expires_at: float = 0.0
+        self.soundcloud_client_id = os.getenv("SOUNDCLOUD_CLIENT_ID")
+        self.soundcloud_client_secret = os.getenv("SOUNDCLOUD_CLIENT_SECRET")
+        self._soundcloud_token: str | None = None
+        self._soundcloud_token_expires_at: float = 0.0
         self.last_playback_error: dict[int, str] = {}
         self.audio_stats: dict[int, CountingPCMVolumeTransformer] = {}
         self.voice_send_stats: dict[int, dict[str, int | str]] = {}
@@ -761,76 +771,344 @@ class Music(commands.Cog):
                 )
         return None
 
+
+    async def _validate_stream_url(self, url: str) -> bool:
+        """Follow redirects and request only a tiny byte range to reject HTML/error pages."""
+        timeout = aiohttp.ClientTimeout(total=12, connect=6, sock_read=6)
+        headers = {"Range": "bytes=0-1", "Icy-MetaData": "0"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers, allow_redirects=True) as response:
+                    if response.status not in (200, 206):
+                        return False
+                    content_type = (response.headers.get("Content-Type") or "").lower()
+                    if any(x in content_type for x in ("text/html", "application/json", "text/plain")):
+                        return False
+                    await response.content.read(2)
+                    return True
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return False
+
+    async def search_audius(self, query: str) -> Track | None:
+        """Search public streamable Audius tracks using the official read-only API."""
+        timeout = aiohttp.ClientTimeout(total=14, connect=7, sock_read=8)
+        params = {"query": query, "limit": 20}
+        if self.audius_api_key:
+            params["api_key"] = self.audius_api_key
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    "https://api.audius.co/v1/tracks/search", params=params
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    payload = await response.json(content_type=None)
+
+            ranked = []
+            for item in payload.get("data") or []:
+                if not isinstance(item, dict):
+                    continue
+                user = item.get("user") or {}
+                title = str(item.get("title") or "")
+                artist = str(user.get("name") or user.get("handle") or "")
+                streamable = item.get("isStreamable", item.get("is_streamable", True))
+                if streamable is False or str(streamable).lower() in {"false", "0", "no"}:
+                    continue
+                if item.get("isStreamGated") or item.get("is_stream_gated"):
+                    continue
+                score = self._match_score(query, title, artist)
+                if score >= 0.60:
+                    ranked.append((score, item))
+
+            ranked.sort(key=lambda pair: pair[0], reverse=True)
+            for score, item in ranked[:5]:
+                track_id = item.get("id")
+                if not track_id:
+                    continue
+                stream_url = f"https://api.audius.co/v1/tracks/{track_id}/stream"
+                if self.audius_api_key:
+                    from urllib.parse import urlencode
+                    stream_url += "?" + urlencode({"api_key": self.audius_api_key})
+
+                artwork = item.get("artwork") or {}
+                duration_seconds = item.get("duration")
+                try:
+                    duration_seconds = int(float(duration_seconds)) if duration_seconds is not None else None
+                except (TypeError, ValueError):
+                    duration_seconds = None
+                duration_text = (
+                    f"{duration_seconds // 60}:{duration_seconds % 60:02d}"
+                    if duration_seconds else "Durasi tidak diketahui"
+                )
+                return Track(
+                    url=stream_url,
+                    title=str(item.get("title") or query),
+                    requester_id=0,
+                    webpage_url=item.get("permalink") or "https://audius.co",
+                    duration=duration_text,
+                    duration_seconds=duration_seconds,
+                    thumbnail=artwork.get("_480x480") or artwork.get("_1000x1000") or artwork.get("_150x150"),
+                    artist=str((item.get("user") or {}).get("name") or ""),
+                    license_url=None,
+                    source="Audius",
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
+            print(f"Fumi Audius search warning: {type(error).__name__}: {error}")
+        return None
+
+    async def _get_soundcloud_token(self) -> str | None:
+        """Cache official SoundCloud Client Credentials token for public playback/search."""
+        if not self.soundcloud_client_id or not self.soundcloud_client_secret:
+            return None
+        if self._soundcloud_token and time.time() < self._soundcloud_token_expires_at - 90:
+            return self._soundcloud_token
+        timeout = aiohttp.ClientTimeout(total=12)
+        try:
+            auth = aiohttp.BasicAuth(self.soundcloud_client_id, self.soundcloud_client_secret)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    "https://secure.soundcloud.com/oauth/token",
+                    data={"grant_type": "client_credentials"},
+                    auth=auth,
+                    headers={"Accept": "application/json"},
+                ) as response:
+                    if response.status != 200:
+                        print(f"Fumi SoundCloud token error: HTTP {response.status}")
+                        return None
+                    data = await response.json(content_type=None)
+            token = data.get("access_token")
+            if not token:
+                return None
+            self._soundcloud_token = str(token)
+            self._soundcloud_token_expires_at = time.time() + int(data.get("expires_in") or 3600)
+            return self._soundcloud_token
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            print(f"Fumi SoundCloud auth warning: {type(error).__name__}: {error}")
+            return None
+
+    async def search_soundcloud(self, query: str) -> Track | None:
+        """Optional official SoundCloud API provider; inactive without credentials in env."""
+        token = await self._get_soundcloud_token()
+        if not token:
+            return None
+        timeout = aiohttp.ClientTimeout(total=16, connect=7, sock_read=9)
+        headers = {"Authorization": f"OAuth {token}", "Accept": "application/json"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(
+                    "https://api.soundcloud.com/tracks",
+                    params={"q": query, "access": "playable", "limit": 20},
+                ) as response:
+                    if response.status != 200:
+                        print(f"Fumi SoundCloud search warning: HTTP {response.status}")
+                        return None
+                    payload = await response.json(content_type=None)
+
+                rows = payload.get("collection", payload if isinstance(payload, list) else [])
+                ranked = []
+                for item in rows or []:
+                    if not isinstance(item, dict):
+                        continue
+                    access = str(item.get("access") or "").lower()
+                    if access and access != "playable":
+                        continue
+                    user = item.get("user") or {}
+                    artist = str(item.get("metadata_artist") or user.get("username") or user.get("full_name") or "")
+                    score = self._match_score(query, item.get("title"), artist)
+                    if score >= 0.60:
+                        ranked.append((score, item))
+                ranked.sort(key=lambda pair: pair[0], reverse=True)
+
+                for score, item in ranked[:5]:
+                    urn = item.get("urn")
+                    if not urn:
+                        continue
+                    from urllib.parse import quote
+                    encoded_urn = quote(str(urn), safe=":")
+                    async with session.get(
+                        f"https://api.soundcloud.com/tracks/{encoded_urn}/streams"
+                    ) as response:
+                        if response.status != 200:
+                            continue
+                        stream_data = await response.json(content_type=None)
+                    stream_url = (
+                        stream_data.get("http_mp3_128_url")
+                        or stream_data.get("http_aac_160_url")
+                        or stream_data.get("preview_mp3_128_url")
+                    )
+                    if not stream_url:
+                        continue
+                    duration_ms = item.get("duration")
+                    try:
+                        duration_seconds = int(int(duration_ms) / 1000) if duration_ms else None
+                    except (TypeError, ValueError):
+                        duration_seconds = None
+                    duration_text = (
+                        f"{duration_seconds // 60}:{duration_seconds % 60:02d}"
+                        if duration_seconds else "Durasi tidak diketahui"
+                    )
+                    return Track(
+                        url=str(stream_url),
+                        title=str(item.get("title") or query),
+                        requester_id=0,
+                        webpage_url=item.get("permalink_url"),
+                        duration=duration_text,
+                        duration_seconds=duration_seconds,
+                        thumbnail=item.get("artwork_url"),
+                        artist=str((item.get("user") or {}).get("username") or ""),
+                        license_url=None,
+                        source="SoundCloud",
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
+            print(f"Fumi SoundCloud search warning: {type(error).__name__}: {error}")
+        return None
+
     async def search_multi_source(self, query: str) -> Track | None:
         """
-        Balanced discovery:
-        - iTunes / Deezer / MusicBrainz enrich title+artist metadata.
-        - Jamendo / Internet Archive remain the only playback providers.
-        - Search candidates concurrently, then select the highest-confidence licensed stream.
+        Maximum Search:
+        metadata expansion + parallel search across Jamendo, Internet Archive,
+        Audius and optional official SoundCloud API. Select the best matching
+        candidate only after its media URL passes a lightweight HTTP validation.
         """
         query_candidates = [query]
         try:
-            metadata_queries = await self.discover_metadata_queries(query)
-            query_candidates.extend(metadata_queries)
+            query_candidates.extend(await self.discover_metadata_queries(query))
         except Exception as error:
             print(f"Fumi metadata discovery warning: {type(error).__name__}: {error}")
 
-        # Keep the fan-out bounded to avoid excessive API traffic and long command delays.
-        unique_queries: list[str] = []
-        seen: set[str] = set()
+        unique_queries = []
+        seen = set()
         for candidate in query_candidates:
             normalized = self._normalize_text(candidate)
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 unique_queries.append(candidate)
-            if len(unique_queries) >= 3:
+            if len(unique_queries) >= 4:
                 break
 
-        jobs = []
-        for candidate in unique_queries:
-            jobs.append(("Jamendo", candidate, self.search_jamendo(candidate)))
-            jobs.append(("Internet Archive", candidate, self.search_internet_archive(candidate)))
+        providers = [
+            ("Jamendo", self.search_jamendo),
+            ("Internet Archive", self.search_internet_archive),
+            ("Audius", self.search_audius),
+        ]
+        if self.soundcloud_client_id and self.soundcloud_client_secret:
+            providers.append(("SoundCloud", self.search_soundcloud))
 
-        results = await asyncio.gather(
-            *(job[2] for job in jobs),
-            return_exceptions=True,
-        )
+        jobs = [
+            (provider_name, candidate, method(candidate))
+            for candidate in unique_queries
+            for provider_name, method in providers
+        ]
+        results = await asyncio.gather(*(job[2] for job in jobs), return_exceptions=True)
 
-        ranked: list[tuple[float, int, Track]] = []
-        errors: list[str] = []
+        ranked = []
+        errors = []
         for index, result in enumerate(results):
-            source_name, searched_query, _ = jobs[index]
+            provider_name, searched_query, _ = jobs[index]
             if isinstance(result, Exception):
-                errors.append(f"{source_name}: {type(result).__name__}: {result}")
+                errors.append(f"{provider_name}: {type(result).__name__}: {result}")
                 continue
             if result is None:
                 continue
-
-            # Always score against the user's original request, not the metadata-expanded query.
             score = self._match_score(query, result.title, result.artist)
-            if score < 0.68:
+            if score < 0.66:
                 continue
-
-            # Tiny tie-break preference for Jamendo's track metadata/cover quality.
-            tie_break = 0.005 if result.source == "Jamendo" else 0.0
-            ranked.append((score + tie_break, index, result))
+            if not await self._validate_stream_url(result.url):
+                continue
+            provider_bonus = {
+                "Jamendo": 0.012,
+                "Audius": 0.009,
+                "SoundCloud": 0.006,
+                "Internet Archive": 0.0,
+            }.get(result.source, 0.0)
+            ranked.append((score + provider_bonus, index, result))
 
         if errors:
-            print("Fumi multi-source search warnings: " + " | ".join(errors[:6]))
+            print("Fumi Maximum Search warnings: " + " | ".join(errors[:8]))
         if not ranked:
             return None
-
         ranked.sort(key=lambda item: item[0], reverse=True)
         best_score, _, best_track = ranked[0]
-        if best_score < 0.68:
-            return None
-
+        best_track.fallback_tracks = []
+        for _, _, alternative in ranked[1:]:
+            if alternative.url != best_track.url:
+                alternative.requester_id = best_track.requester_id
+                alternative.fallback_tracks = []
+                best_track.fallback_tracks.append(alternative)
         print(
-            "Fumi selected licensed result: "
-            f"source={best_track.source}; title={best_track.title!r}; "
-            f"artist={best_track.artist!r}; confidence={best_score:.3f}"
+            "Fumi Maximum Search selected: "
+            f"provider={best_track.source}; title={best_track.title!r}; "
+            f"artist={best_track.artist!r}; score={best_score:.3f}; "
+            f"fallbacks={len(best_track.fallback_tracks)}"
         )
         return best_track
+
+
+    async def _get_spotify_token(self) -> str | None:
+        """Cache Spotify Web API Client Credentials token; no user account access."""
+        if not self.spotify_client_id or not self.spotify_client_secret:
+            return None
+        if self._spotify_token and time.time() < self._spotify_token_expires_at - 60:
+            return self._spotify_token
+        timeout = aiohttp.ClientTimeout(total=12)
+        try:
+            auth = aiohttp.BasicAuth(self.spotify_client_id, self.spotify_client_secret)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    "https://accounts.spotify.com/api/token",
+                    data={"grant_type": "client_credentials"},
+                    auth=auth,
+                ) as response:
+                    if response.status != 200:
+                        print(f"Fumi Spotify token warning: HTTP {response.status}")
+                        return None
+                    data = await response.json(content_type=None)
+            token = data.get("access_token")
+            if not token:
+                return None
+            self._spotify_token = str(token)
+            self._spotify_token_expires_at = time.time() + int(data.get("expires_in") or 3600)
+            return self._spotify_token
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            print(f"Fumi Spotify auth warning: {type(error).__name__}: {error}")
+            return None
+
+    async def spotify_track_metadata(self, url: str) -> dict | None:
+        """Read official Spotify track metadata (title, artists, album, ISRC) when configured."""
+        match = re.search(r"open\.spotify\.com/(?:intl-[a-z-]+/)?track/([A-Za-z0-9]+)", url)
+        if not match:
+            return None
+        token = await self._get_spotify_token()
+        if not token:
+            return None
+        timeout = aiohttp.ClientTimeout(total=12)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                headers={"Authorization": f"Bearer {token}"},
+            ) as session:
+                async with session.get(
+                    f"https://api.spotify.com/v1/tracks/{match.group(1)}"
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    item = await response.json(content_type=None)
+            artists = [artist.get("name", "") for artist in item.get("artists", []) if artist.get("name")]
+            external_ids = item.get("external_ids") or {}
+            return {
+                "title": str(item.get("name") or ""),
+                "artist": ", ".join(artists),
+                "album": str((item.get("album") or {}).get("name") or ""),
+                "isrc": str(external_ids.get("isrc") or ""),
+                "duration_ms": item.get("duration_ms"),
+                "thumbnail": next(
+                    (image.get("url") for image in (item.get("album") or {}).get("images", []) if image.get("url")),
+                    None,
+                ),
+            }
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            print(f"Fumi Spotify metadata warning: {type(error).__name__}: {error}")
+            return None
 
     async def spotify_oembed_title(self, url: str) -> str | None:
         """Ambil judul publik dari oEmbed Spotify; tidak mengambil audio Spotify."""
@@ -991,25 +1269,45 @@ class Music(commands.Cog):
                         print(f"Fumi Music playback error: {error}")
                     else:
                         self.last_playback_error.pop(guild_id, None)
-                    future = asyncio.run_coroutine_threadsafe(self._after_track(guild_id), self.bot.loop)
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._after_track(guild_id, playback_error=error), self.bot.loop
+                    )
                     try:
                         future.result(timeout=0)
                     except Exception:
                         pass
                 voice.play(source, after=after_play)
             except Exception as error:
-                print(f"Gagal memulai audio: {error}")
+                print(f"Gagal memulai audio dari {track.source}: {error}")
+                if track.fallback_tracks:
+                    fallback = track.fallback_tracks.pop(0)
+                    fallback.fallback_tracks = list(track.fallback_tracks)
+                    fallback.requester_id = track.requester_id
+                    player.queue.appendleft(fallback)
+                    print(f"Fumi fallback: mencoba {fallback.source} — {fallback.title}")
                 player.current = None
                 if player.queue:
                     self.bot.loop.call_soon(asyncio.create_task, self.start_next(guild_id))
             await self.refresh_player(guild_id)
 
-    async def _after_track(self, guild_id: int):
+    async def _after_track(self, guild_id: int, playback_error: Exception | None = None):
         player = self.get_player(guild_id)
         if player.suppress_next:
             player.suppress_next = False
             await self.refresh_player(guild_id)
             return
+
+        failed_track = player.current
+        if playback_error and failed_track and failed_track.fallback_tracks:
+            fallback = failed_track.fallback_tracks.pop(0)
+            fallback.fallback_tracks = list(failed_track.fallback_tracks)
+            fallback.requester_id = failed_track.requester_id
+            player.queue.appendleft(fallback)
+            print(
+                f"Fumi playback fallback after stream error: "
+                f"{fallback.source} — {fallback.title}"
+            )
+
         if not player.repeat:
             if player.current is not None:
                 player.history.append(player.current)
@@ -1065,30 +1363,37 @@ class Music(commands.Cog):
         if is_spotify:
             status = await ctx.send("🔎 Membaca metadata Spotify, lalu mencari versi audio berlisensi...")
             try:
-                spotify_title = await self.spotify_oembed_title(query)
-                if not spotify_title:
-                    await status.edit(content=(
-                        "❌ Metadata Spotify tidak dapat dibaca. Kirim judul lagu dan artisnya "
-                        "agar Fumi bisa mencari di katalog audio yang tersedia."
-                    ))
-                    return
-                # Spotify oEmbed titles often look like "happy - Gustixa Remix".
-                # The suffix is frequently a remix/version label, not the artist name.
-                # Convert it to a neutral token query so the metadata providers can
-                # resolve the real title and artist instead of treating "Gustixa Remix"
-                # as a literal artist field.
-                spotify_search_query = re.sub(
-                    r"\s*[-–—]\s*(?=.*\b(?:remix|edit|version|sped\s*up|slowed|nightcore)\b)",
-                    " ",
-                    spotify_title,
-                    flags=re.IGNORECASE,
-                )
-                spotify_search_query = re.sub(
-                    r"\s*[-–—]\s*",
-                    " ",
-                    spotify_search_query,
-                )
-                spotify_search_query = re.sub(r"\s+", " ", spotify_search_query).strip()
+                spotify_meta = await self.spotify_track_metadata(query)
+                if spotify_meta and spotify_meta.get("title"):
+                    spotify_title = str(spotify_meta["title"])
+                    spotify_artist = str(spotify_meta.get("artist") or "")
+                    spotify_search_query = " ".join(
+                        part for part in (spotify_title, spotify_artist) if part
+                    ).strip()
+                else:
+                    spotify_title = await self.spotify_oembed_title(query)
+                    if not spotify_title:
+                        await status.edit(content=(
+                            "❌ Metadata Spotify tidak dapat dibaca. Kirim judul lagu dan artisnya "
+                            "agar Fumi bisa mencari di katalog audio yang tersedia."
+                        ))
+                        return
+                    # oEmbed fallback has only a display title, so normalize version suffixes.
+                    version_suffix = re.match(
+                        r"^(.*?)\s*[-–—]\s*(.*?)\s+(?:official\s+)?"
+                        r"(?:remix|edit|version|sped\s*up|slowed|nightcore)\b.*$",
+                        spotify_title,
+                        flags=re.IGNORECASE,
+                    )
+                    if version_suffix:
+                        spotify_search_query = " ".join(
+                            part for part in (version_suffix.group(1).strip(), version_suffix.group(2).strip())
+                            if part
+                        )
+                    else:
+                        spotify_search_query = re.sub(r"\s*[-–—]\s*", " ", spotify_title)
+                    spotify_search_query = re.sub(r"\s+", " ", spotify_search_query).strip()
+
                 track = await self.search_multi_source(spotify_search_query or spotify_title)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
                 await status.edit(content=f"❌ Pencarian sumber audio gagal: `{error}`")
@@ -1130,7 +1435,7 @@ class Music(commands.Cog):
             )
             await self.lookup_track_metadata(track)
         else:
-            status = await ctx.send(f"🔎 Mencari di Jamendo + Internet Archive untuk **{discord.utils.escape_markdown(query)}**...")
+            status = await ctx.send(f"🔎 Maximum Search: mencari di Jamendo, Internet Archive, dan Audius untuk **{discord.utils.escape_markdown(query)}**...")
             try:
                 track = await self.search_multi_source(query)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
@@ -1138,7 +1443,7 @@ class Music(commands.Cog):
                 return
             if track is None:
                 await status.edit(
-                    content="Tidak menemukan stream audio berlisensi yang cocok di Jamendo atau Internet Archive. Lagu komersial tertentu memang tidak tersedia di katalog gratis ini. Coba judul + artis, atau tautan audio resmi yang mengizinkan streaming bot."
+                    content="Tidak menemukan stream yang cocok dan dapat diakses di Jamendo, Internet Archive, atau Audius. Lagu komersial tertentu memang tidak tersedia di katalog gratis ini. Coba judul + artis, atau tautan audio resmi yang mengizinkan streaming bot."
                 )
                 return
             track.requester_id = ctx.author.id
