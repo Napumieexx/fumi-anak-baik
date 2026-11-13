@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.metadata
 import os
 import random
 import re
@@ -788,24 +787,6 @@ class Music(commands.Cog):
             value="✅ Library Opus terdeteksi" if opus_loaded else "❌ Library Opus belum termuat",
             inline=False,
         )
-        # discord.py 2.7.1+ includes DAVE voice support; report runtime versions
-        # because an older already-installed package may remain on the host.
-        try:
-            discord_version = importlib.metadata.version("discord.py")
-        except importlib.metadata.PackageNotFoundError:
-            discord_version = getattr(discord, "__version__", "Tidak diketahui")
-        try:
-            davey_version = importlib.metadata.version("davey")
-            davey_status = f"✅ davey {davey_version}"
-        except importlib.metadata.PackageNotFoundError:
-            davey_status = "❌ Paket davey tidak terpasang"
-        try:
-            has_dave = getattr(discord.voice_client, "has_dave", None)
-            dave_support = "Tersedia" if has_dave is True else ("Tidak tersedia" if has_dave is False else "Tidak dapat dipastikan")
-        except Exception:
-            dave_support = "Tidak dapat diperiksa"
-        embed.add_field(name="discord.py version", value=f"`{discord_version}`", inline=True)
-        embed.add_field(name="DAVE support", value=f"{dave_status}\\nRuntime: **{dave_support}**", inline=True)
         if voice is not None:
             try:
                 latency_text = f"{voice.latency * 1000:.0f} ms"
