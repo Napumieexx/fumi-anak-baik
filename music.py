@@ -775,7 +775,40 @@ class Music(commands.Cog):
 
         last_error = self.last_playback_error.get(ctx.guild.id)
         embed.add_field(name="Playback error terakhir", value=f"```{last_error[:900]}```" if last_error else "Tidak ada error playback yang tercatat sejak bot aktif.", inline=False)
-        embed.set_footer(text="Diagnostik ini tidak mengirim URL stream atau rahasia konfigurasi.")
+
+        # Uji decode stream aktif secara terpisah dari Discord Voice.
+        # Hanya ringkasan hasil yang dikirim; URL stream tidak pernah ditampilkan.
+        if track and ffmpeg_path:
+            test_msg = await ctx.send("🔬 Menguji apakah FFmpeg benar-benar bisa membaca dan mendekode stream aktif (maks. 8 detik)...")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    ffmpeg_path, "-nostdin", "-hide_banner", "-v", "error",
+                    "-i", track.url, "-t", "5", "-f", "null", "-",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
+                detail = (stderr or b"").decode("utf-8", errors="replace").strip()
+                if proc.returncode == 0:
+                    result = "✅ FFmpeg berhasil mendekode stream selama tes. Sumber audio terbaca."
+                else:
+                    result = f"❌ FFmpeg gagal mendekode stream (exit {proc.returncode})."
+                if detail:
+                    result += "\n```\n" + detail[:900] + "\n```"
+                await test_msg.edit(content=result)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+                await test_msg.edit(content="⚠️ Tes stream melewati batas 8 detik. Stream lambat, macet, atau tidak merespons.")
+            except Exception as error:
+                await test_msg.edit(content=f"❌ Tes stream gagal dijalankan: `{str(error)[:300]}`")
+        elif not track:
+            embed.add_field(name="Tes stream", value="Putar lagu terlebih dahulu, lalu jalankan `!musicdebug` lagi.", inline=False)
+
+        embed.set_footer(text="Diagnostik tidak menampilkan URL stream atau rahasia konfigurasi.")
         await ctx.send(embed=embed)
 
     @commands.command(name="help", aliases=["musichelp", "mhelp"])
