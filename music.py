@@ -19,8 +19,8 @@ from discord.ext import commands
 
 
 # Fumi Music - High Quality player
-# Search playback uses Jamendo API stream URLs; direct authorized audio URLs are also supported.
-# Spotify/YouTube page URLs are not extracted or ripped.
+# Metadata discovery: iTunes, MusicBrainz, Deezer. Licensed playback: Jamendo / Internet Archive.
+# Spotify/YouTube page URLs are not extracted or ripped; metadata is never treated as an audio license.
 
 PLAYER_COLOR = discord.Color.from_rgb(35, 190, 120)
 ERROR_COLOR = discord.Color.orange()
@@ -313,103 +313,267 @@ class Music(commands.Cog):
         return embed
 
     @staticmethod
+    def _normalize_text(value: str | None) -> str:
+        import unicodedata
+
+        value = unicodedata.normalize("NFKD", value or "")
+        value = "".join(ch for ch in value if not unicodedata.combining(ch))
+        value = value.casefold()
+        value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+        return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _parse_explicit_query(query: str) -> tuple[str, str | None]:
+        """Recognize common 'title - artist' and 'title by artist' forms."""
+        text = query.strip()
+        patterns = (r"\s+[–—-]\s+", r"\s+by\s+", r"\s+\|\s+")
+        for pattern in patterns:
+            parts = re.split(pattern, text, maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                return parts[0].strip(), parts[1].strip()
+        return text, None
+
+    @staticmethod
     def _search_variants(query: str) -> list[str]:
-        """Buat variasi pencarian aman tanpa membuang kata penting."""
+        """Generate safe query variants while preserving title and artist words."""
         q = re.sub(r"\s+", " ", query).strip()
-        variants = []
-        if q:
-            variants.append(q)
-            # Spotify oEmbed kadang mengembalikan "Title - Artist".
-            if " - " in q:
-                left, right = [part.strip() for part in q.split(" - ", 1)]
-                if left:
-                    variants.append(left)
-                if right:
-                    variants.append(right)
-                if left and right:
-                    variants.append(f"{left} {right}")
-            # Tambahkan versi tanpa tanda baca agar API katalog lebih mudah mencocokkan.
-            plain = re.sub(r"[^\w\s]", " ", q, flags=re.UNICODE)
-            plain = re.sub(r"\s+", " ", plain).strip()
-            if plain and plain.casefold() != q.casefold():
-                variants.append(plain)
-        seen = set()
-        result = []
+        variants: list[str] = []
+        if not q:
+            return variants
+
+        variants.append(q)
+        title, artist = Music._parse_explicit_query(q)
+        if artist:
+            variants.extend((f"{title} {artist}", title))
+        plain = re.sub(r"[^\w\s]", " ", q, flags=re.UNICODE)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if plain and plain.casefold() != q.casefold():
+            variants.append(plain)
+
+        seen: set[str] = set()
+        result: list[str] = []
         for item in variants:
             key = item.casefold()
             if key and key not in seen:
                 seen.add(key)
                 result.append(item)
-        return result[:5]
+        return result[:4]
 
     @staticmethod
-    def _match_score(query: str, title: str | None, artist: str | None = None) -> float:
-        """Strict title/artist matching. Rejects results that only share one generic word."""
-        from difflib import SequenceMatcher
+    def _token_similarity(left: str, right: str) -> float:
+        """Similarity from 0..1, using RapidFuzz when installed."""
+        if not left or not right:
+            return 0.0
+        try:
+            from rapidfuzz import fuzz
+            return max(
+                fuzz.ratio(left, right),
+                fuzz.partial_ratio(left, right) * 0.92,
+                fuzz.token_sort_ratio(left, right),
+            ) / 100.0
+        except Exception:
+            from difflib import SequenceMatcher
+            return SequenceMatcher(None, left, right).ratio()
 
-        def norm(value: str | None) -> str:
-            value = (value or "").casefold()
-            value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
-            return re.sub(r"\s+", " ", value).strip()
-
-        def compact(value: str | None) -> str:
-            return re.sub(r"\s+", "", norm(value))
-
-        q = norm(query)
-        t = norm(title)
-        a = norm(artist)
+    @classmethod
+    def _match_score(cls, query: str, title: str | None, artist: str | None = None) -> float:
+        """
+        Rank candidate title/artist against a user's query.
+        Handles typos and spacing (e.g. 'yungkai' vs 'yung kai') while
+        rejecting candidates that only share a generic title word.
+        """
+        q = cls._normalize_text(query)
+        t = cls._normalize_text(title)
+        a = cls._normalize_text(artist)
         if not q or not t:
             return 0.0
 
-        # Explicit "title - artist" form: both fields must match.
-        explicit = re.split(r"\s+-\s+", query.strip(), maxsplit=1)
-        if len(explicit) == 2 and explicit[0].strip() and explicit[1].strip():
-            wanted_title = norm(explicit[0])
-            wanted_artist = norm(explicit[1])
-            title_score = max(
-                SequenceMatcher(None, wanted_title, t).ratio(),
-                len(set(wanted_title.split()) & set(t.split())) / max(1, len(set(wanted_title.split()))),
-            )
-            artist_score = max(
-                SequenceMatcher(None, compact(wanted_artist), compact(artist)).ratio(),
-                len(set(wanted_artist.split()) & set(a.split())) / max(1, len(set(wanted_artist.split()))),
-            )
-            if title_score < 0.68 or artist_score < 0.60:
+        wanted_title, wanted_artist = cls._parse_explicit_query(query)
+        if wanted_artist:
+            wt = cls._normalize_text(wanted_title)
+            wa = cls._normalize_text(wanted_artist)
+            title_score = cls._token_similarity(wt, t)
+            artist_score = cls._token_similarity(wa.replace(" ", ""), a.replace(" ", ""))
+            if title_score < 0.55 or artist_score < 0.52:
                 return 0.0
-            return 0.72 * title_score + 0.28 * artist_score
+            return 0.68 * title_score + 0.32 * artist_score
 
         q_tokens = q.split()
-        t_tokens = set(t.split())
-        a_tokens = set(a.split())
-        t_compact = compact(title)
-        a_compact = compact(artist)
-
-        # A token may match a compact artist spelling (e.g. "yungkai" vs "yung kai").
-        matched = 0
-        title_hits = 0
-        artist_hits = 0
-        for token in q_tokens:
-            in_title = token in t_tokens or (len(token) >= 5 and token in t_compact)
-            in_artist = token in a_tokens or (len(token) >= 5 and token in a_compact)
-            if in_title or in_artist:
-                matched += 1
-            if in_title:
-                title_hits += 1
-            if in_artist:
-                artist_hits += 1
-
-        coverage = matched / max(1, len(q_tokens))
-        title_coverage = title_hits / max(1, len(q_tokens))
-        title_similarity = SequenceMatcher(None, q, t).ratio()
-
-        # For multiword requests, require most query words to appear in title+artist.
-        # This blocks "Wildflower Harp" by an unrelated creator for "Wildflower yung kai".
-        if len(q_tokens) > 1 and coverage < 0.67:
-            return 0.0
-        if title_coverage == 0 and title_similarity < 0.72:
+        title_tokens = t.split()
+        artist_tokens = a.split()
+        if not q_tokens:
             return 0.0
 
-        return 0.72 * coverage + 0.28 * max(title_coverage, title_similarity)
+        def best_token_match(token: str, candidates: list[str], compact_candidate: str) -> float:
+            scores = [cls._token_similarity(token, candidate) for candidate in candidates]
+            if len(token) >= 5 and token in compact_candidate:
+                scores.append(0.96)
+            return max(scores, default=0.0)
+
+        title_matches = [
+            best_token_match(token, title_tokens, t.replace(" ", ""))
+            for token in q_tokens
+        ]
+        artist_matches = [
+            best_token_match(token, artist_tokens, a.replace(" ", ""))
+            for token in q_tokens
+        ]
+        combined_matches = [max(x, y) for x, y in zip(title_matches, artist_matches)]
+
+        # Fuzzy token coverage makes typo-tolerant matching possible.
+        coverage = sum(1 for score in combined_matches if score >= 0.76) / len(q_tokens)
+        title_coverage = sum(1 for score in title_matches if score >= 0.76) / len(q_tokens)
+        artist_coverage = sum(1 for score in artist_matches if score >= 0.76) / len(q_tokens)
+
+        # A multiword query must be represented by title and/or artist,
+        # not merely by a single shared word such as "wildflower".
+        if len(q_tokens) >= 2 and coverage < 0.67:
+            return 0.0
+        if title_coverage == 0 and artist_coverage < 0.67:
+            return 0.0
+
+        whole_title_score = cls._token_similarity(q, t)
+        score = (
+            0.52 * coverage
+            + 0.25 * title_coverage
+            + 0.15 * artist_coverage
+            + 0.08 * whole_title_score
+        )
+        return min(1.0, score)
+
+    @staticmethod
+    def _is_explicit_cc_license(license_url: str | None) -> bool:
+        """Only accept a clearly identified Creative Commons/public-domain license URL."""
+        if not isinstance(license_url, str):
+            return False
+        value = license_url.casefold()
+        return (
+            "creativecommons.org/licenses/" in value
+            or "creativecommons.org/publicdomain/" in value
+        )
+
+    async def _metadata_search_itunes(self, query: str) -> list[dict[str, str]]:
+        """iTunes is metadata/cover discovery only; it does not provide playback permission."""
+        timeout = aiohttp.ClientTimeout(total=8)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    "https://itunes.apple.com/search",
+                    params={"term": query, "entity": "song", "limit": 8},
+                ) as response:
+                    if response.status != 200:
+                        return []
+                    data = await response.json(content_type=None)
+            output = []
+            for item in data.get("results") or []:
+                title, artist = item.get("trackName"), item.get("artistName")
+                if title:
+                    output.append({
+                        "title": str(title),
+                        "artist": str(artist or ""),
+                        "source": "iTunes",
+                    })
+            return output
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            print(f"Fumi iTunes metadata warning: {error}")
+            return []
+
+    async def _metadata_search_deezer(self, query: str) -> list[dict[str, str]]:
+        """Deezer search is used for metadata only, never as an audio stream."""
+        timeout = aiohttp.ClientTimeout(total=8)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    "https://api.deezer.com/search/track",
+                    params={"q": query, "limit": 8},
+                ) as response:
+                    if response.status != 200:
+                        return []
+                    data = await response.json(content_type=None)
+            output = []
+            for item in data.get("data") or []:
+                title = item.get("title")
+                artist = (item.get("artist") or {}).get("name")
+                if title:
+                    output.append({
+                        "title": str(title),
+                        "artist": str(artist or ""),
+                        "source": "Deezer",
+                    })
+            return output
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            print(f"Fumi Deezer metadata warning: {error}")
+            return []
+
+    async def _metadata_search_musicbrainz(self, query: str) -> list[dict[str, str]]:
+        """MusicBrainz recording lookup; metadata only, with an identifying User-Agent."""
+        timeout = aiohttp.ClientTimeout(total=10)
+        headers = {"User-Agent": "FumiDiscordMusicBot/1.0 (metadata search)"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(
+                    "https://musicbrainz.org/ws/2/recording/",
+                    params={"query": query, "fmt": "json", "limit": 8},
+                ) as response:
+                    if response.status != 200:
+                        return []
+                    data = await response.json(content_type=None)
+            output = []
+            for item in data.get("recordings") or []:
+                title = item.get("title")
+                artist_parts = []
+                for credit in item.get("artist-credit") or []:
+                    if isinstance(credit, dict):
+                        artist = credit.get("name") or (credit.get("artist") or {}).get("name")
+                        if artist:
+                            artist_parts.append(str(artist))
+                if title:
+                    output.append({
+                        "title": str(title),
+                        "artist": " ".join(artist_parts),
+                        "source": "MusicBrainz",
+                    })
+            return output
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            print(f"Fumi MusicBrainz metadata warning: {error}")
+            return []
+
+    async def discover_metadata_queries(self, query: str) -> list[str]:
+        """
+        Expand a user query using independent metadata catalogs.
+        Returned strings are still searched against licensed playback providers only.
+        """
+        tasks = (
+            self._metadata_search_itunes(query),
+            self._metadata_search_deezer(query),
+            self._metadata_search_musicbrainz(query),
+        )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        candidates: list[tuple[float, str]] = []
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Fumi metadata discovery warning: {type(result).__name__}: {result}")
+                continue
+            for item in result:
+                score = self._match_score(query, item.get("title"), item.get("artist"))
+                if score >= 0.55:
+                    candidate_query = " ".join(
+                        part for part in (item.get("title"), item.get("artist")) if part
+                    ).strip()
+                    if candidate_query:
+                        candidates.append((score, candidate_query))
+
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        output: list[str] = []
+        seen = {self._normalize_text(query)}
+        for _, candidate in candidates:
+            key = self._normalize_text(candidate)
+            if key and key not in seen:
+                seen.add(key)
+                output.append(candidate)
+            if len(output) >= 2:
+                break
+        return output
 
     async def search_jamendo(self, query: str, track_id: str | None = None) -> Track | None:
         """Cari beberapa variasi judul/artis di katalog Jamendo dan ambil stream resmi."""
@@ -417,7 +581,7 @@ class Music(commands.Cog):
             return None
 
         timeout = aiohttp.ClientTimeout(total=22)
-        audio_formats = ("mp32", "mp31", "ogg", "flac")
+        audio_formats = ("mp32", "mp31")
         variants = [query] if track_id else self._search_variants(query)
         candidates: dict[str, tuple[float, dict]] = {}
         last_error = None
@@ -460,6 +624,9 @@ class Music(commands.Cog):
                             continue
                         audio = row.get("audio")
                         if not isinstance(audio, str) or not audio.startswith(("http://", "https://")):
+                            continue
+                        license_url = row.get("license_ccurl")
+                        if not self._is_explicit_cc_license(license_url):
                             continue
                         row_id = str(row.get("id") or audio)
                         score = self._match_score(query, row.get("name"), row.get("artist_name"))
@@ -595,23 +762,75 @@ class Music(commands.Cog):
         return None
 
     async def search_multi_source(self, query: str) -> Track | None:
-        """Cari berurutan di katalog Jamendo dan Internet Archive yang berlisensi."""
-        errors = []
-        # Jamendo harus dicoba untuk pencarian teks; sebelumnya jalur ini IA-only.
-        for source_name, searcher in (
-            ("Jamendo", self.search_jamendo),
-            ("Internet Archive", self.search_internet_archive),
-        ):
-            try:
-                track = await searcher(query)
-                if track is not None:
-                    return track
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
-                errors.append(f"{source_name}: {error}")
-                print(f"Fumi {source_name} search warning: {error}")
+        """
+        Balanced discovery:
+        - iTunes / Deezer / MusicBrainz enrich title+artist metadata.
+        - Jamendo / Internet Archive remain the only playback providers.
+        - Search candidates concurrently, then select the highest-confidence licensed stream.
+        """
+        query_candidates = [query]
+        try:
+            metadata_queries = await self.discover_metadata_queries(query)
+            query_candidates.extend(metadata_queries)
+        except Exception as error:
+            print(f"Fumi metadata discovery warning: {type(error).__name__}: {error}")
+
+        # Keep the fan-out bounded to avoid excessive API traffic and long command delays.
+        unique_queries: list[str] = []
+        seen: set[str] = set()
+        for candidate in query_candidates:
+            normalized = self._normalize_text(candidate)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique_queries.append(candidate)
+            if len(unique_queries) >= 3:
+                break
+
+        jobs = []
+        for candidate in unique_queries:
+            jobs.append(("Jamendo", candidate, self.search_jamendo(candidate)))
+            jobs.append(("Internet Archive", candidate, self.search_internet_archive(candidate)))
+
+        results = await asyncio.gather(
+            *(job[2] for job in jobs),
+            return_exceptions=True,
+        )
+
+        ranked: list[tuple[float, int, Track]] = []
+        errors: list[str] = []
+        for index, result in enumerate(results):
+            source_name, searched_query, _ = jobs[index]
+            if isinstance(result, Exception):
+                errors.append(f"{source_name}: {type(result).__name__}: {result}")
+                continue
+            if result is None:
+                continue
+
+            # Always score against the user's original request, not the metadata-expanded query.
+            score = self._match_score(query, result.title, result.artist)
+            if score < 0.68:
+                continue
+
+            # Tiny tie-break preference for Jamendo's track metadata/cover quality.
+            tie_break = 0.005 if result.source == "Jamendo" else 0.0
+            ranked.append((score + tie_break, index, result))
+
         if errors:
-            print("Fumi multi-source search warnings: " + " | ".join(errors))
-        return None
+            print("Fumi multi-source search warnings: " + " | ".join(errors[:6]))
+        if not ranked:
+            return None
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        best_score, _, best_track = ranked[0]
+        if best_score < 0.68:
+            return None
+
+        print(
+            "Fumi selected licensed result: "
+            f"source={best_track.source}; title={best_track.title!r}; "
+            f"artist={best_track.artist!r}; confidence={best_score:.3f}"
+        )
+        return best_track
 
     async def spotify_oembed_title(self, url: str) -> str | None:
         """Ambil judul publik dari oEmbed Spotify; tidak mengambil audio Spotify."""
