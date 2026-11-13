@@ -279,7 +279,7 @@ class Music(commands.Cog):
         timeout = aiohttp.ClientTimeout(total=20)
         # mp32 adalah MP3 VBR berkualitas lebih baik. Format lain menjadi fallback
         # jika suatu track tidak menyediakan URL audio pada format tersebut.
-        audio_formats = ("mp32", "mp31", "ogg", "flac")
+        audio_formats = ("mp31",)
         last_error = None
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
