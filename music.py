@@ -4,6 +4,7 @@ import asyncio
 import os
 import random
 import re
+import shutil
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -132,6 +133,7 @@ class Music(commands.Cog):
         self.players: dict[int, GuildPlayer] = defaultdict(GuildPlayer)
         self.progress_task: asyncio.Task | None = None
         self.jamendo_client_id = os.getenv("JAMENDO_CLIENT_ID")
+        self.last_playback_error: dict[int, str] = {}
 
     async def cog_load(self):
         self.progress_task = asyncio.create_task(self.progress_updater())
@@ -528,7 +530,10 @@ class Music(commands.Cog):
                 )
                 def after_play(error: Exception | None):
                     if error:
+                        self.last_playback_error[guild_id] = str(error)[:500]
                         print(f"Fumi Music playback error: {error}")
+                    else:
+                        self.last_playback_error.pop(guild_id, None)
                     future = asyncio.run_coroutine_threadsafe(self._after_track(guild_id), self.bot.loop)
                     try:
                         future.result(timeout=0)
@@ -731,6 +736,47 @@ class Music(commands.Cog):
         player.current = None
         await ctx.guild.voice_client.disconnect()
         await ctx.send("👋 Fumi telah meninggalkan voice channel.")
+
+    @commands.command(name="musicdebug", aliases=["mdebug"])
+    async def music_debug_command(self, ctx: commands.Context):
+        """Diagnostik musik yang hasilnya dikirim ke channel tempat command dipakai."""
+        if ctx.guild is None:
+            await ctx.send("Diagnostik musik hanya bisa digunakan di server.")
+            return
+
+        player = self.get_player(ctx.guild.id)
+        voice = ctx.guild.voice_client
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffprobe_path = shutil.which("ffprobe")
+
+        embed = discord.Embed(title="🩺 FUMI MUSIC DIAGNOSTICS", color=PLAYER_COLOR)
+        embed.add_field(name="FFmpeg", value=(f"✅ Terdeteksi: `{ffmpeg_path}`" if ffmpeg_path else "❌ Tidak ditemukan di PATH"), inline=False)
+        embed.add_field(name="FFprobe", value=(f"✅ Terdeteksi: `{ffprobe_path}`" if ffprobe_path else "⚠️ Tidak ditemukan (opsional)"), inline=False)
+
+        if voice is None:
+            voice_status = "❌ Fumi tidak terhubung ke voice channel."
+        else:
+            channel_name = getattr(voice.channel, "name", "Unknown")
+            voice_status = f"✅ Terhubung ke **{channel_name}**"
+            voice_status += f"\nPlaying: **{voice.is_playing()}** | Paused: **{voice.is_paused()}**"
+        embed.add_field(name="Voice connection", value=voice_status, inline=False)
+
+        track = player.current
+        if track:
+            parsed = urlparse(track.url)
+            host = parsed.netloc or "Tidak diketahui"
+            track_status = f"**{discord.utils.escape_markdown(track.title)[:100]}**\nHost stream: `{host}`\nSumber: `{getattr(track, 'source', 'Tidak diketahui')}`"
+        else:
+            track_status = "Tidak ada track aktif."
+        embed.add_field(name="Track aktif", value=track_status, inline=False)
+        embed.add_field(name="Queue", value=f"{len(player.queue)} lagu", inline=True)
+        embed.add_field(name="Volume", value=f"{int(player.volume * 100)}%", inline=True)
+        embed.add_field(name="Jamendo Client ID", value="✅ Tersedia" if self.jamendo_client_id else "❌ Belum diatur", inline=True)
+
+        last_error = self.last_playback_error.get(ctx.guild.id)
+        embed.add_field(name="Playback error terakhir", value=f"```{last_error[:900]}```" if last_error else "Tidak ada error playback yang tercatat sejak bot aktif.", inline=False)
+        embed.set_footer(text="Diagnostik ini tidak mengirim URL stream atau rahasia konfigurasi.")
+        await ctx.send(embed=embed)
 
     @commands.command(name="help", aliases=["musichelp", "mhelp"])
     async def music_help_command(self, ctx: commands.Context):
