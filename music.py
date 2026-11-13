@@ -23,6 +23,21 @@ PLAYER_COLOR = discord.Color.from_rgb(35, 190, 120)
 ERROR_COLOR = discord.Color.orange()
 
 
+class CountingPCMVolumeTransformer(discord.PCMVolumeTransformer):
+    """PCM transformer that counts decoded audio frames for diagnostics."""
+    def __init__(self, original, volume: float = 1.0):
+        super().__init__(original, volume=volume)
+        self.frames_read = 0
+        self.bytes_read = 0
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self.frames_read += 1
+            self.bytes_read += len(data)
+        return data
+
+
 @dataclass
 class Track:
     url: str
@@ -134,6 +149,7 @@ class Music(commands.Cog):
         self.progress_task: asyncio.Task | None = None
         self.jamendo_client_id = os.getenv("JAMENDO_CLIENT_ID")
         self.last_playback_error: dict[int, str] = {}
+        self.audio_stats: dict[int, CountingPCMVolumeTransformer] = {}
 
     async def cog_load(self):
         self.progress_task = asyncio.create_task(self.progress_updater())
@@ -524,10 +540,11 @@ class Music(commands.Cog):
             before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
             options = "-vn -ac 2 -ar 48000"
             try:
-                source = discord.PCMVolumeTransformer(
+                source = CountingPCMVolumeTransformer(
                     discord.FFmpegPCMAudio(track.url, before_options=before_options, options=options),
                     volume=player.volume,
                 )
+                self.audio_stats[guild_id] = source
                 def after_play(error: Exception | None):
                     if error:
                         self.last_playback_error[guild_id] = str(error)[:500]
@@ -760,6 +777,32 @@ class Music(commands.Cog):
             voice_status = f"✅ Terhubung ke **{channel_name}**"
             voice_status += f"\nPlaying: **{voice.is_playing()}** | Paused: **{voice.is_paused()}**"
         embed.add_field(name="Voice connection", value=voice_status, inline=False)
+
+        try:
+            opus_loaded = discord.opus.is_loaded()
+        except Exception:
+            opus_loaded = False
+        embed.add_field(
+            name="Opus encoder",
+            value="✅ Library Opus terdeteksi" if opus_loaded else "❌ Library Opus belum termuat",
+            inline=False,
+        )
+        if voice is not None:
+            try:
+                latency_text = f"{voice.latency * 1000:.0f} ms"
+            except Exception:
+                latency_text = "Tidak tersedia"
+            embed.add_field(name="Voice latency", value=latency_text, inline=True)
+
+        stats = self.audio_stats.get(ctx.guild.id)
+        if stats is not None:
+            embed.add_field(
+                name="PCM frames terbaca",
+                value=f"{stats.frames_read:,} frame · {stats.bytes_read:,} byte",
+                inline=True,
+            )
+        else:
+            embed.add_field(name="PCM frames terbaca", value="Belum ada data source aktif.", inline=True)
 
         track = player.current
         if track:
