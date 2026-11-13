@@ -290,161 +290,223 @@ class Music(commands.Cog):
         embed.set_footer(text="Fumi Music • Multi-source audio • !shuffle untuk mengacak antrean")
         return embed
 
-    async def search_jamendo(self, query: str, track_id: str | None = None) -> Track | None:
-        """Cari track di katalog Jamendo dan ambil URL stream resmi."""
-        if not self.jamendo_client_id:
-            raise RuntimeError(
-                "JAMENDO_CLIENT_ID belum diatur. Masukkan Client ID Jamendo ke environment/.env."
-            )
+    @staticmethod
+    def _search_variants(query: str) -> list[str]:
+        """Buat variasi pencarian aman tanpa membuang kata penting."""
+        q = re.sub(r"\s+", " ", query).strip()
+        variants = []
+        if q:
+            variants.append(q)
+            # Spotify oEmbed kadang mengembalikan "Title - Artist".
+            if " - " in q:
+                left, right = [part.strip() for part in q.split(" - ", 1)]
+                if left:
+                    variants.append(left)
+                if right:
+                    variants.append(right)
+                if left and right:
+                    variants.append(f"{left} {right}")
+            # Tambahkan versi tanpa tanda baca agar API katalog lebih mudah mencocokkan.
+            plain = re.sub(r"[^\w\s]", " ", q, flags=re.UNICODE)
+            plain = re.sub(r"\s+", " ", plain).strip()
+            if plain and plain.casefold() != q.casefold():
+                variants.append(plain)
+        seen = set()
+        result = []
+        for item in variants:
+            key = item.casefold()
+            if key and key not in seen:
+                seen.add(key)
+                result.append(item)
+        return result[:5]
 
-        timeout = aiohttp.ClientTimeout(total=20)
-        # mp32 adalah MP3 VBR berkualitas lebih baik. Format lain menjadi fallback
-        # jika suatu track tidak menyediakan URL audio pada format tersebut.
+    @staticmethod
+    def _match_score(query: str, title: str | None, artist: str | None = None) -> float:
+        """Skor ringan untuk memilih hasil yang paling relevan; tidak mengubah lisensi."""
+        from difflib import SequenceMatcher
+        q = re.sub(r"[^\w\s]", " ", query.casefold())
+        q = re.sub(r"\s+", " ", q).strip()
+        title_clean = re.sub(r"[^\w\s]", " ", (title or "").casefold())
+        title_clean = re.sub(r"\s+", " ", title_clean).strip()
+        candidate = " ".join(x for x in [title or "", artist or ""] if x)
+        candidate = re.sub(r"[^\w\s]", " ", candidate.casefold())
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if not q or not candidate:
+            return 0.0
+        # Judul saja tetap bisa mendapat skor penuh meskipun query tidak menyebut artis.
+        return max(
+            SequenceMatcher(None, q, title_clean).ratio(),
+            SequenceMatcher(None, q, candidate).ratio(),
+        )
+
+    async def search_jamendo(self, query: str, track_id: str | None = None) -> Track | None:
+        """Cari beberapa variasi judul/artis di katalog Jamendo dan ambil stream resmi."""
+        if not self.jamendo_client_id:
+            return None
+
+        timeout = aiohttp.ClientTimeout(total=22)
         audio_formats = ("mp32", "mp31", "ogg", "flac")
+        variants = [query] if track_id else self._search_variants(query)
+        candidates: dict[str, tuple[float, dict]] = {}
         last_error = None
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for audio_format in audio_formats:
-                params = {
-                    "client_id": self.jamendo_client_id,
-                    "format": "json",
-                    "limit": 10,
-                    "audioformat": audio_format,
-                    "imagesize": 500,
-                    "include": "licenses",
-                    # API secara default hanya mengembalikan track album.
-                    # Sertakan single juga agar hasil pencarian lebih lengkap.
-                    "type": "single albumtrack",
-                }
-                if track_id:
-                    params["id"] = track_id
-                else:
-                    params["search"] = query
+            for variant in variants:
+                for audio_format in audio_formats:
+                    params = {
+                        "client_id": self.jamendo_client_id,
+                        "format": "json",
+                        "limit": 30,
+                        "audioformat": audio_format,
+                        "imagesize": 500,
+                        "include": "licenses",
+                        "type": "single albumtrack",
+                        "order": "relevance",
+                    }
+                    if track_id:
+                        params["id"] = track_id
+                    else:
+                        params["search"] = variant
 
-                try:
-                    async with session.get(
-                        "https://api.jamendo.com/v3.0/tracks/",
-                        params=params,
-                    ) as response:
-                        if response.status != 200:
-                            body = (await response.text())[:300]
-                            last_error = RuntimeError(
-                                f"Jamendo API HTTP {response.status}: {body}"
-                            )
+                    try:
+                        async with session.get("https://api.jamendo.com/v3.0/tracks/", params=params) as response:
+                            if response.status != 200:
+                                last_error = RuntimeError(f"Jamendo HTTP {response.status}")
+                                continue
+                            data = await response.json(content_type=None)
+                    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+                        last_error = error
+                        continue
+
+                    headers = data.get("headers", {})
+                    if headers.get("status") != "success":
+                        last_error = RuntimeError(headers.get("error_message") or "Jamendo API error")
+                        continue
+
+                    for row in data.get("results") or []:
+                        if not isinstance(row, dict):
                             continue
-                        data = await response.json(content_type=None)
-                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-                    last_error = error
-                    continue
+                        audio = row.get("audio")
+                        if not isinstance(audio, str) or not audio.startswith(("http://", "https://")):
+                            continue
+                        row_id = str(row.get("id") or audio)
+                        score = self._match_score(query, row.get("name"), row.get("artist_name"))
+                        old = candidates.get(row_id)
+                        if old is None or score > old[0]:
+                            candidates[row_id] = (score, row)
+                    # Jika sudah ada kecocokan sangat kuat, tidak perlu semua format.
+                    if candidates and max(score for score, _ in candidates.values()) >= 0.92:
+                        break
+                if candidates and max(score for score, _ in candidates.values()) >= 0.92:
+                    break
 
-                headers = data.get("headers", {})
-                if headers.get("status") != "success":
-                    last_error = RuntimeError(
-                        headers.get("error_message") or "Pencarian Jamendo gagal."
-                    )
-                    continue
-
-                results = data.get("results") or []
-                item = next(
-                    (
-                        row for row in results
-                        if isinstance(row, dict)
-                        and isinstance(row.get("audio"), str)
-                        and row["audio"].startswith(("http://", "https://"))
-                    ),
-                    None,
-                )
-                if not item:
-                    continue
-
-                duration = int(item.get("duration") or 0)
-                license_url = item.get("license_ccurl")
-                if not license_url:
-                    licenses = item.get("licenses") or []
-                    if licenses and isinstance(licenses[0], dict):
-                        license_url = licenses[0].get("url")
-
-                return Track(
-                    url=item["audio"],
-                    title=item.get("name") or query,
-                    artist=item.get("artist_name"),
-                    requester_id=0,
-                    webpage_url=item.get("shareurl") or item.get("shorturl"),
-                    duration=self._format_time(duration) if duration else "Durasi tidak diketahui",
-                    duration_seconds=duration or None,
-                    thumbnail=item.get("image") or item.get("album_image"),
-                    license_url=license_url,
-                    source="Jamendo",
-                )
-
-        if last_error:
-            raise RuntimeError(f"Gagal menghubungi katalog Jamendo: {last_error}") from last_error
-        return None
-
-    async def search_internet_archive(self, query: str) -> Track | None:
-        """Cari audio Internet Archive hanya jika item mencantumkan lisensi yang jelas."""
-        timeout = aiohttp.ClientTimeout(total=18)
-        safe_query = query.replace('"', ' ').strip()
-        if not safe_query:
+        if not candidates:
+            if last_error:
+                print(f"Fumi Jamendo search warning: {last_error}")
             return None
 
+        # Jangan mengembalikan hasil acak: pilih kecocokan tertinggi, dengan URL audio resmi.
+        best_score, item = max(candidates.values(), key=lambda pair: pair[0])
+        if best_score < 0.38:
+            return None
+        duration = int(item.get("duration") or 0)
+        license_url = item.get("license_ccurl")
+        if not license_url:
+            licenses = item.get("licenses") or []
+            if licenses and isinstance(licenses[0], dict):
+                license_url = licenses[0].get("url")
+        return Track(
+            url=item["audio"],
+            title=item.get("name") or query,
+            artist=item.get("artist_name"),
+            requester_id=0,
+            webpage_url=item.get("shareurl") or item.get("shorturl"),
+            duration=self._format_time(duration) if duration else "Durasi tidak diketahui",
+            duration_seconds=duration or None,
+            thumbnail=item.get("image") or item.get("album_image"),
+            license_url=license_url,
+            source="Jamendo",
+        )
+
+    async def search_internet_archive(self, query: str) -> Track | None:
+        """Cari audio IA dengan beberapa pola metadata; hanya putar item berlisensi jelas."""
+        timeout = aiohttp.ClientTimeout(total=22)
+        variants = self._search_variants(query)
+        if not variants:
+            return None
+
+        from urllib.parse import quote
         search_url = "https://archive.org/advancedsearch.php"
-        params = {
-            "q": f'mediatype:audio AND (title:"{safe_query}" OR creator:"{safe_query}")',
-            "fl[]": ["identifier", "title", "creator", "licenseurl"],
-            "rows": 8,
-            "page": 1,
-            "output": "json",
-        }
-
+        docs_by_id: dict[str, dict] = {}
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(search_url, params=params) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Internet Archive search HTTP {response.status}")
-                data = await response.json(content_type=None)
+            for variant in variants:
+                safe = variant.replace('"', ' ').strip()
+                if not safe:
+                    continue
+                # Query broadens title/creator matching; license validation remains mandatory below.
+                params = {
+                    "q": f'mediatype:audio AND (title:"{safe}" OR creator:"{safe}" OR title:({safe}))',
+                    "fl[]": ["identifier", "title", "creator", "licenseurl", "description", "subject"],
+                    "rows": 30,
+                    "page": 1,
+                    "output": "json",
+                }
+                try:
+                    async with session.get(search_url, params=params) as response:
+                        if response.status != 200:
+                            continue
+                        data = await response.json(content_type=None)
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    continue
+                for doc in data.get("response", {}).get("docs", []):
+                    identifier = doc.get("identifier")
+                    if identifier:
+                        docs_by_id[identifier] = doc
 
-            docs = data.get("response", {}).get("docs", [])
-            for doc in docs:
+            ranked_docs = sorted(
+                docs_by_id.values(),
+                key=lambda d: self._match_score(query, d.get("title"), d.get("creator") if isinstance(d.get("creator"), str) else " ".join(d.get("creator") or [])),
+                reverse=True,
+            )
+
+            for doc in ranked_docs[:40]:
                 identifier = doc.get("identifier")
                 license_url = doc.get("licenseurl") or ""
-                # Jangan putar item tanpa lisensi yang dapat diverifikasi.
                 if not identifier or not (
                     "creativecommons.org/licenses/" in license_url
                     or "creativecommons.org/publicdomain/" in license_url
                 ):
                     continue
+                try:
+                    async with session.get(f"https://archive.org/metadata/{identifier}") as response:
+                        if response.status != 200:
+                            continue
+                        metadata = await response.json(content_type=None)
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    continue
 
-                metadata_url = f"https://archive.org/metadata/{identifier}"
-                async with session.get(metadata_url) as response:
-                    if response.status != 200:
-                        continue
-                    metadata = await response.json(content_type=None)
-
-                files = metadata.get("files", [])
                 candidates = []
-                for file_info in files:
+                for file_info in metadata.get("files", []):
                     name = file_info.get("name", "")
                     fmt = (file_info.get("format") or "").lower()
-                    lower_name = name.lower()
-                    if lower_name.endswith(".mp3") and "original" not in lower_name and "_spectrogram" not in lower_name:
+                    lower = name.lower()
+                    if lower.endswith((".mp3", ".ogg", ".flac", ".wav", ".m4a")) and not any(
+                        marker in lower for marker in ("spectrogram", "thumbnail", "sample", "_small", "preview")
+                    ):
                         size = int(file_info.get("size") or 0)
                         candidates.append((size, name))
-                    elif fmt in {"mp3", "vbr mp3"} and lower_name.endswith(".mp3"):
-                        size = int(file_info.get("size") or 0)
-                        candidates.append((size, name))
-
+                    elif fmt in {"mp3", "vbr mp3", "ogg vorbis", "flac", "wave", "m4a"}:
+                        if lower.endswith((".mp3", ".ogg", ".flac", ".wav", ".m4a")):
+                            candidates.append((int(file_info.get("size") or 0), name))
                 if not candidates:
                     continue
-                # Pilih file MP3 terbesar agar tidak mengambil thumbnail/preview kecil.
                 _, filename = max(candidates, key=lambda item: item[0])
-                from urllib.parse import quote
-                audio_url = f"https://archive.org/download/{identifier}/{quote(filename, safe='/')}"
                 creator = doc.get("creator")
                 if isinstance(creator, list):
                     creator = ", ".join(str(x) for x in creator[:2])
                 duration = None
                 return Track(
-                    url=audio_url,
+                    url=f"https://archive.org/download/{identifier}/{quote(filename, safe='/')}",
                     title=doc.get("title") or query,
                     artist=creator if isinstance(creator, str) else None,
                     requester_id=0,
@@ -457,16 +519,23 @@ class Music(commands.Cog):
         return None
 
     async def search_multi_source(self, query: str) -> Track | None:
-        """Mode tes: pencarian judul hanya memakai Internet Archive.
-
-        Jamendo tetap bisa dipakai jika pengguna memberikan URL track Jamendo,
-        tetapi tidak dipanggil untuk pencarian teks atau pencarian metadata Spotify.
-        """
-        try:
-            return await self.search_internet_archive(query)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
-            print(f"Fumi Internet Archive search error: {error}")
-            raise RuntimeError(f"Internet Archive: {error}") from error
+        """Cari berurutan di katalog Jamendo dan Internet Archive yang berlisensi."""
+        errors = []
+        # Jamendo harus dicoba untuk pencarian teks; sebelumnya jalur ini IA-only.
+        for source_name, searcher in (
+            ("Jamendo", self.search_jamendo),
+            ("Internet Archive", self.search_internet_archive),
+        ):
+            try:
+                track = await searcher(query)
+                if track is not None:
+                    return track
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
+                errors.append(f"{source_name}: {error}")
+                print(f"Fumi {source_name} search warning: {error}")
+        if errors:
+            print("Fumi multi-source search warnings: " + " | ".join(errors))
+        return None
 
     async def spotify_oembed_title(self, url: str) -> str | None:
         """Ambil judul publik dari oEmbed Spotify; tidak mengambil audio Spotify."""
@@ -749,7 +818,7 @@ class Music(commands.Cog):
             )
             await self.lookup_track_metadata(track)
         else:
-            status = await ctx.send(f"🔎 Menguji Internet Archive saja untuk **{discord.utils.escape_markdown(query)}**...")
+            status = await ctx.send(f"🔎 Mencari di Jamendo + Internet Archive untuk **{discord.utils.escape_markdown(query)}**...")
             try:
                 track = await self.search_multi_source(query)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
@@ -757,7 +826,7 @@ class Music(commands.Cog):
                 return
             if track is None:
                 await status.edit(
-                    content="Tidak menemukan audio berlisensi yang cocok di katalog Fumi. Coba judul + nama artis lain."
+                    content="Tidak menemukan stream audio berlisensi yang cocok di Jamendo atau Internet Archive. Lagu komersial tertentu memang tidak tersedia di katalog gratis ini. Coba judul + artis, atau tautan audio resmi yang mengizinkan streaming bot."
                 )
                 return
             track.requester_id = ctx.author.id
