@@ -36,6 +36,7 @@ class FumiBot(commands.Bot):
     async def setup_hook(self):
         # Muat fitur AFK Voice sebagai extension terpisah.
         await self.load_extension("afk_voice")
+        await self.load_extension("music")
 
 
 bot = FumiBot(
@@ -114,6 +115,7 @@ async def on_ready():
     print("Quiz system terdaftar.")
     print("RPG system terdaftar.")
     print("AFK Voice extension aktif.")
+    print("Music system aktif (High Quality).")
 
     if LOG_CHANNEL_ID:
         print(f"Mod Log dikonfigurasi: {LOG_CHANNEL_ID}")
