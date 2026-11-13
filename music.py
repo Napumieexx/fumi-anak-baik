@@ -115,22 +115,41 @@ class FumiPlayerView(discord.ui.View):
             return False
         return True
 
-    async def _ack(self, interaction: discord.Interaction, message: str):
+    async def _defer(self, interaction: discord.Interaction):
+        # Acknowledge within Discord's interaction deadline before doing async work.
         if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+    async def _ack(self, interaction: discord.Interaction, message: str):
+        # Use followup after defer; fall back to initial response if not deferred.
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
             await interaction.response.send_message(message, ephemeral=True)
 
     @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ok = await self.cog.previous_track(self.guild_id)
-        await self._ack(interaction, "Memutar lagu sebelumnya." if ok else "Tidak ada lagu sebelumnya.")
+        await self._defer(interaction)
+        try:
+            ok = await self.cog.previous_track(self.guild_id)
+            await self._ack(interaction, "Memutar lagu sebelumnya." if ok else "Tidak ada lagu sebelumnya.")
+        except Exception:
+            await self._ack(interaction, "Gagal memutar lagu sebelumnya. Coba lagi.")
+            raise
 
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog.stop_track(self.guild_id)
-        await self._ack(interaction, "Pemutaran dihentikan. Fumi tetap berada di voice channel.")
+        await self._defer(interaction)
+        try:
+            await self.cog.stop_track(self.guild_id)
+            await self._ack(interaction, "Pemutaran dihentikan. Fumi tetap berada di voice channel.")
+        except Exception:
+            await self._ack(interaction, "Gagal menghentikan pemutaran. Coba lagi.")
+            raise
 
     @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.primary, row=0)
     async def pause_resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._defer(interaction)
         voice = interaction.guild.voice_client
         if voice.is_playing():
             voice.pause()
@@ -149,6 +168,7 @@ class FumiPlayerView(discord.ui.View):
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._defer(interaction)
         voice = interaction.guild.voice_client
         if voice and (voice.is_playing() or voice.is_paused()):
             voice.stop()
@@ -158,10 +178,12 @@ class FumiPlayerView(discord.ui.View):
 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.success, row=0)
     async def repeat_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._defer(interaction)
         player = self.cog.players[self.guild_id]
         player.repeat = not player.repeat
         button.style = discord.ButtonStyle.success if player.repeat else discord.ButtonStyle.secondary
-        await interaction.response.edit_message(embed=self.cog.make_embed(self.guild_id), view=self)
+        await interaction.message.edit(embed=self.cog.make_embed(self.guild_id), view=self)
+        await self._ack(interaction, "Repeat diaktifkan." if player.repeat else "Repeat dinonaktifkan.")
 
 
 class Music(commands.Cog):
