@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import timedelta
 
 import discord
@@ -13,6 +14,54 @@ from quiz import setup_quiz
 from menu import setup_menu
 from rpg import setup_rpg
 
+
+
+# =========================
+# SAFE DAVE DIAGNOSTIC LOGGING
+# =========================
+# discord.gateway emits full Voice WebSocket payloads at DEBUG level. Those
+# payloads can contain credentials/keys, so only allow selected DAVE status
+# messages and binary-opcode metadata through to the FadeHost console.
+class SafeDaveLogFilter(logging.Filter):
+    SAFE_PREFIXES = (
+        "Voice websocket binary frame received:",
+        "Set MLS external sender",
+        "MLS proposals processed",
+        "MLS commit processed",
+        "MLS welcome processed",
+        "Preparing for DAVE transition",
+        "Executing DAVE transition",
+        "Preparing for DAVE epoch",
+        "DAVE Session downgraded",
+        "DAVE Session upgraded",
+        "Executing transition id",
+        "Transition id",
+        "Received execute transition, but we don't have a pending transition",
+    )
+
+    def filter(self, record):
+        message_template = record.msg if isinstance(record.msg, str) else ""
+        return message_template.startswith(self.SAFE_PREFIXES)
+
+
+def configure_safe_dave_logging():
+    logger = logging.getLogger("discord.gateway")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    # Avoid duplicate console output if setup is called again.
+    if not any(getattr(handler, "_fumi_dave_handler", False) for handler in logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.DEBUG)
+        handler.addFilter(SafeDaveLogFilter())
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s DAVE %(levelname)s: %(message)s"
+        ))
+        handler._fumi_dave_handler = True
+        logger.addHandler(handler)
+
+
+configure_safe_dave_logging()
 
 # =========================
 # LOAD ENV
