@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import json
+from pathlib import Path
 import math
 import struct
 import os
@@ -19,7 +21,7 @@ from discord.ext import commands
 
 
 # Fumi Music - High Quality player
-# Metadata discovery: iTunes, MusicBrainz, Deezer. Playback discovery: Jamendo, Internet Archive, Audius, optional official SoundCloud API.
+# Metadata discovery: iTunes, MusicBrainz, Deezer. Playback discovery: Jamendo, Internet Archive, Audius.
 # Spotify/YouTube page URLs are not extracted or ripped; metadata is never treated as an audio license.
 
 PLAYER_COLOR = discord.Color.from_rgb(35, 190, 120)
@@ -90,6 +92,7 @@ class GuildPlayer:
     view: discord.ui.View | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     suppress_next: bool = False
+    seek_offset: float = 0.0
 
 
 class FumiPlayerView(discord.ui.View):
@@ -187,6 +190,56 @@ class FumiPlayerView(discord.ui.View):
         await self._ack(interaction, "Repeat diaktifkan." if player.repeat else "Repeat dinonaktifkan.")
 
 
+class SearchResultsView(discord.ui.View):
+    """Interactive result picker for !search; never exposes stream URLs."""
+    def __init__(self, cog: "Music", guild_id: int, requester_id: int, tracks: list[Track]):
+        super().__init__(timeout=90)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.requester_id = requester_id
+        self.tracks = tracks[:25]
+        options = []
+        for index, track in enumerate(self.tracks):
+            label = f"{track.title}"[:95]
+            description = f"{track.artist or 'Artis tidak diketahui'} · {track.source}"[:95]
+            options.append(discord.SelectOption(label=label or f"Track {index+1}", description=description, value=str(index)))
+        select = discord.ui.Select(placeholder="Pilih lagu yang ingin diputar…", min_values=1, max_values=1, options=options)
+        select.callback = self.select_track
+        self.add_item(select)
+
+    async def select_track(self, interaction: discord.Interaction):
+        if interaction.guild is None or interaction.guild.id != self.guild_id or interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Hanya orang yang melakukan pencarian ini yang dapat memilih hasil.", ephemeral=True)
+            return
+        if not getattr(interaction.user, "voice", None) or not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("Masuk ke voice channel terlebih dahulu.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        track = self.tracks[int(interaction.data["values"][0])]
+        track.requester_id = interaction.user.id
+        guild = interaction.guild
+        voice = guild.voice_client
+        try:
+            if voice is None:
+                voice = await interaction.user.voice.channel.connect()
+            elif voice.channel != interaction.user.voice.channel:
+                await voice.move_to(interaction.user.voice.channel)
+            self.cog.instrument_voice_sender(guild.id, voice)
+            player = self.cog.get_player(guild.id)
+            player.text_channel_id = interaction.channel_id
+            player.queue.append(track)
+            if not voice.is_playing() and not voice.is_paused() and player.current is None:
+                await self.cog.start_next(guild.id)
+            channel = self.cog.bot.get_channel(interaction.channel_id)
+            if channel:
+                await self.cog.send_or_update_player_to_channel(channel, guild.id)
+            await interaction.followup.send(f"Ditambahkan: **{discord.utils.escape_markdown(track.title)}**", ephemeral=True)
+            self.stop()
+        except (discord.Forbidden, discord.HTTPException) as error:
+            await interaction.followup.send(f"Gagal bergabung atau memutar lagu: `{error}`", ephemeral=True)
+
+
+
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -198,10 +251,7 @@ class Music(commands.Cog):
         self.spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         self._spotify_token: str | None = None
         self._spotify_token_expires_at: float = 0.0
-        self.soundcloud_client_id = os.getenv("SOUNDCLOUD_CLIENT_ID")
-        self.soundcloud_client_secret = os.getenv("SOUNDCLOUD_CLIENT_SECRET")
-        self._soundcloud_token: str | None = None
-        self._soundcloud_token_expires_at: float = 0.0
+        self.playlist_file = Path(__file__).with_name("fumi_playlists.json")
         self.last_playback_error: dict[int, str] = {}
         self.audio_stats: dict[int, CountingPCMVolumeTransformer] = {}
         self.voice_send_stats: dict[int, dict[str, int | str]] = {}
@@ -816,6 +866,19 @@ class Music(commands.Cog):
                     continue
                 if item.get("isStreamGated") or item.get("is_stream_gated"):
                     continue
+                # A streamable flag is not a copyright license. Require an explicit
+                # CC/public-domain declaration before making it available to the bot.
+                license_value = item.get("license") or item.get("license_url") or item.get("licenseUrl")
+                if isinstance(license_value, dict):
+                    license_value = license_value.get("url") or license_value.get("name") or license_value.get("type")
+                license_text = str(license_value or "")
+                license_lower = license_text.casefold()
+                if not ("creativecommons.org/licenses/" in license_lower
+                        or "creativecommons.org/publicdomain/" in license_lower
+                        or "creative commons" in license_lower
+                        or "cc-by" in license_lower or "cc0" in license_lower
+                        or "public domain" in license_lower):
+                    continue
                 score = self._match_score(query, title, artist)
                 if score >= 0.60:
                     ranked.append((score, item))
@@ -849,125 +912,20 @@ class Music(commands.Cog):
                     duration_seconds=duration_seconds,
                     thumbnail=artwork.get("_480x480") or artwork.get("_1000x1000") or artwork.get("_150x150"),
                     artist=str((item.get("user") or {}).get("name") or ""),
-                    license_url=None,
+                    license_url=license_text if license_text.startswith("http") else None,
                     source="Audius",
                 )
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
             print(f"Fumi Audius search warning: {type(error).__name__}: {error}")
         return None
 
-    async def _get_soundcloud_token(self) -> str | None:
-        """Cache official SoundCloud Client Credentials token for public playback/search."""
-        if not self.soundcloud_client_id or not self.soundcloud_client_secret:
-            return None
-        if self._soundcloud_token and time.time() < self._soundcloud_token_expires_at - 90:
-            return self._soundcloud_token
-        timeout = aiohttp.ClientTimeout(total=12)
-        try:
-            auth = aiohttp.BasicAuth(self.soundcloud_client_id, self.soundcloud_client_secret)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    "https://secure.soundcloud.com/oauth/token",
-                    data={"grant_type": "client_credentials"},
-                    auth=auth,
-                    headers={"Accept": "application/json"},
-                ) as response:
-                    if response.status != 200:
-                        print(f"Fumi SoundCloud token error: HTTP {response.status}")
-                        return None
-                    data = await response.json(content_type=None)
-            token = data.get("access_token")
-            if not token:
-                return None
-            self._soundcloud_token = str(token)
-            self._soundcloud_token_expires_at = time.time() + int(data.get("expires_in") or 3600)
-            return self._soundcloud_token
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
-            print(f"Fumi SoundCloud auth warning: {type(error).__name__}: {error}")
-            return None
 
-    async def search_soundcloud(self, query: str) -> Track | None:
-        """Optional official SoundCloud API provider; inactive without credentials in env."""
-        token = await self._get_soundcloud_token()
-        if not token:
-            return None
-        timeout = aiohttp.ClientTimeout(total=16, connect=7, sock_read=9)
-        headers = {"Authorization": f"OAuth {token}", "Accept": "application/json"}
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(
-                    "https://api.soundcloud.com/tracks",
-                    params={"q": query, "access": "playable", "limit": 20},
-                ) as response:
-                    if response.status != 200:
-                        print(f"Fumi SoundCloud search warning: HTTP {response.status}")
-                        return None
-                    payload = await response.json(content_type=None)
-
-                rows = payload.get("collection", payload if isinstance(payload, list) else [])
-                ranked = []
-                for item in rows or []:
-                    if not isinstance(item, dict):
-                        continue
-                    access = str(item.get("access") or "").lower()
-                    if access and access != "playable":
-                        continue
-                    user = item.get("user") or {}
-                    artist = str(item.get("metadata_artist") or user.get("username") or user.get("full_name") or "")
-                    score = self._match_score(query, item.get("title"), artist)
-                    if score >= 0.60:
-                        ranked.append((score, item))
-                ranked.sort(key=lambda pair: pair[0], reverse=True)
-
-                for score, item in ranked[:5]:
-                    urn = item.get("urn")
-                    if not urn:
-                        continue
-                    from urllib.parse import quote
-                    encoded_urn = quote(str(urn), safe=":")
-                    async with session.get(
-                        f"https://api.soundcloud.com/tracks/{encoded_urn}/streams"
-                    ) as response:
-                        if response.status != 200:
-                            continue
-                        stream_data = await response.json(content_type=None)
-                    stream_url = (
-                        stream_data.get("http_mp3_128_url")
-                        or stream_data.get("http_aac_160_url")
-                        or stream_data.get("preview_mp3_128_url")
-                    )
-                    if not stream_url:
-                        continue
-                    duration_ms = item.get("duration")
-                    try:
-                        duration_seconds = int(int(duration_ms) / 1000) if duration_ms else None
-                    except (TypeError, ValueError):
-                        duration_seconds = None
-                    duration_text = (
-                        f"{duration_seconds // 60}:{duration_seconds % 60:02d}"
-                        if duration_seconds else "Durasi tidak diketahui"
-                    )
-                    return Track(
-                        url=str(stream_url),
-                        title=str(item.get("title") or query),
-                        requester_id=0,
-                        webpage_url=item.get("permalink_url"),
-                        duration=duration_text,
-                        duration_seconds=duration_seconds,
-                        thumbnail=item.get("artwork_url"),
-                        artist=str((item.get("user") or {}).get("username") or ""),
-                        license_url=None,
-                        source="SoundCloud",
-                    )
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
-            print(f"Fumi SoundCloud search warning: {type(error).__name__}: {error}")
-        return None
 
     async def search_multi_source(self, query: str) -> Track | None:
         """
         Maximum Search:
         metadata expansion + parallel search across Jamendo, Internet Archive,
-        Audius and optional official SoundCloud API. Select the best matching
+        and Audius entries with an explicit reusable license. Select the best matching
         candidate only after its media URL passes a lightweight HTTP validation.
         """
         query_candidates = [query]
@@ -991,8 +949,6 @@ class Music(commands.Cog):
             ("Internet Archive", self.search_internet_archive),
             ("Audius", self.search_audius),
         ]
-        if self.soundcloud_client_id and self.soundcloud_client_secret:
-            providers.append(("SoundCloud", self.search_soundcloud))
 
         jobs = [
             (provider_name, candidate, method(candidate))
@@ -1018,7 +974,6 @@ class Music(commands.Cog):
             provider_bonus = {
                 "Jamendo": 0.012,
                 "Audius": 0.009,
-                "SoundCloud": 0.006,
                 "Internet Archive": 0.0,
             }.get(result.source, 0.0)
             ranked.append((score + provider_bonus, index, result))
@@ -1249,13 +1204,13 @@ class Music(commands.Cog):
                 await self.refresh_player(guild_id)
                 return
 
-            player.started_at = time.monotonic()
+            player.started_at = time.monotonic() - player.seek_offset
             player.paused_at = None
             player.paused_total = 0.0
 
             # FFmpeg decodes the authorized stream to PCM; discord.py encodes it as Opus
             # using the voice connection's negotiated bitrate/codec.
-            before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+            before_options = f"-ss {max(0.0, player.seek_offset):.2f} -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5" if player.seek_offset else "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
             options = "-vn"
             try:
                 source = CountingPCMVolumeTransformer(
@@ -1277,6 +1232,7 @@ class Music(commands.Cog):
                     except Exception:
                         pass
                 voice.play(source, after=after_play)
+                player.seek_offset = 0.0
             except Exception as error:
                 print(f"Gagal memulai audio dari {track.source}: {error}")
                 if track.fallback_tracks:
@@ -1494,6 +1450,214 @@ class Music(commands.Cog):
                     )
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     pass
+
+    async def search_multi_source_results(self, query: str, limit: int = 10) -> list[Track]:
+        """Collect distinct playable candidates from approved providers for interactive selection."""
+        queries = [query]
+        try:
+            queries.extend(await self.discover_metadata_queries(query))
+        except Exception as error:
+            print(f"Fumi metadata expansion warning: {error}")
+        providers = (self.search_jamendo, self.search_internet_archive, self.search_audius)
+        jobs = [provider(candidate) for candidate in queries[:3] for provider in providers]
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        ranked: list[tuple[float, Track]] = []
+        seen: set[str] = set()
+        for result in results:
+            if isinstance(result, Exception) or result is None:
+                continue
+            score = self._match_score(query, result.title, result.artist)
+            key = result.url.split("?", 1)[0]
+            if score >= 0.60 and key not in seen and await self._validate_stream_url(result.url):
+                seen.add(key)
+                ranked.append((score, result))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [track for _, track in ranked[:limit]]
+
+    async def send_or_update_player_to_channel(self, channel, guild_id: int):
+        player = self.get_player(guild_id)
+        old_message = player.message
+        view = FumiPlayerView(self, guild_id)
+        player.view = view
+        new_message = await channel.send(embed=self.make_embed(guild_id), view=view)
+        player.message = new_message
+        if old_message:
+            try:
+                await old_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    def _load_playlists(self) -> dict:
+        try:
+            if self.playlist_file.exists():
+                data = json.loads(self.playlist_file.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+        except (OSError, ValueError) as error:
+            print(f"Fumi playlist load warning: {error}")
+        return {}
+
+    def _save_playlists(self, data: dict) -> None:
+        temp = self.playlist_file.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(self.playlist_file)
+
+    @commands.command(name="search", aliases=["find"])
+    @commands.guild_only()
+    async def search_command(self, ctx: commands.Context, *, query: str):
+        status = await ctx.send(f"🔎 Mencari beberapa hasil untuk **{discord.utils.escape_markdown(query)}**…")
+        tracks = await self.search_multi_source_results(query, limit=10)
+        if not tracks:
+            await status.edit(content="Tidak ada hasil stream yang cocok dan lolos pemeriksaan sumber.")
+            return
+        view = SearchResultsView(self, ctx.guild.id, ctx.author.id, tracks)
+        await status.edit(content="Pilih lagu yang ingin diputar:", view=view)
+
+    @commands.command(name="volume", aliases=["vol"])
+    @commands.guild_only()
+    async def volume_command(self, ctx: commands.Context, level: int | None = None):
+        player = self.get_player(ctx.guild.id)
+        if level is None:
+            await ctx.send(f"🔊 Volume Fumi: **{round(player.volume * 100)}%**")
+            return
+        if not 0 <= level <= 150:
+            await ctx.send("Volume harus berada di antara 0–150%.")
+            return
+        player.volume = level / 100
+        source = self.audio_stats.get(ctx.guild.id)
+        if source:
+            source.volume = player.volume
+        await self.refresh_player(ctx.guild.id)
+        await ctx.send(f"🔊 Volume diatur ke **{level}%**.")
+
+    @commands.command(name="seek", aliases=["forwardto"])
+    @commands.guild_only()
+    async def seek_command(self, ctx: commands.Context, position: str):
+        player = self.get_player(ctx.guild.id)
+        track = player.current
+        voice = ctx.guild.voice_client
+        if not track or not voice or not (voice.is_playing() or voice.is_paused()):
+            await ctx.send("Tidak ada lagu yang sedang diputar.")
+            return
+        try:
+            bits = [int(part) for part in position.split(":")]
+            if len(bits) == 1:
+                seconds = bits[0]
+            elif len(bits) == 2:
+                seconds = bits[0] * 60 + bits[1]
+            elif len(bits) == 3:
+                seconds = bits[0] * 3600 + bits[1] * 60 + bits[2]
+            else:
+                raise ValueError
+        except ValueError:
+            await ctx.send("Format waktu: `!seek 90`, `!seek 1:30`, atau `!seek 0:01:30`.")
+            return
+        if seconds < 0 or (track.duration_seconds and seconds >= track.duration_seconds):
+            await ctx.send("Posisi seek berada di luar durasi lagu.")
+            return
+        player.seek_offset = float(seconds)
+        player.suppress_next = True
+        was_paused = voice.is_paused()
+        voice.stop()
+        await asyncio.sleep(0.25)
+        player.current = track
+        player.repeat = True
+        await self.start_next(ctx.guild.id)
+        player.repeat = False
+        if was_paused and voice.is_playing():
+            voice.pause()
+            player.paused_at = time.monotonic()
+        await ctx.send(f"⏩ Melompat ke **{self._format_time(seconds)}**.")
+
+    @commands.command(name="remove", aliases=["rm"])
+    @commands.guild_only()
+    async def remove_command(self, ctx: commands.Context, index: int):
+        player = self.get_player(ctx.guild.id)
+        if index < 1 or index > len(player.queue):
+            await ctx.send("Nomor antrean tidak ditemukan.")
+            return
+        track = player.queue[index - 1]
+        del player.queue[index - 1]
+        await ctx.send(f"🗑️ Dihapus dari antrean: **{discord.utils.escape_markdown(track.title)}**")
+        await self.refresh_player(ctx.guild.id)
+
+    @commands.command(name="move", aliases=["mv"])
+    @commands.guild_only()
+    async def move_command(self, ctx: commands.Context, source: int, destination: int):
+        player = self.get_player(ctx.guild.id)
+        if not (1 <= source <= len(player.queue) and 1 <= destination <= len(player.queue)):
+            await ctx.send("Nomor asal atau tujuan tidak valid.")
+            return
+        items = list(player.queue)
+        item = items.pop(source - 1)
+        items.insert(destination - 1, item)
+        player.queue = deque(items)
+        await ctx.send(f"↕️ Lagu dipindahkan dari posisi {source} ke {destination}.")
+        await self.refresh_player(ctx.guild.id)
+
+    @commands.command(name="clear", aliases=["clearqueue", "cq"])
+    @commands.guild_only()
+    async def clear_queue_command(self, ctx: commands.Context):
+        player = self.get_player(ctx.guild.id)
+        count = len(player.queue)
+        player.queue.clear()
+        await self.refresh_player(ctx.guild.id)
+        await ctx.send(f"🧹 Antrean dibersihkan ({count} lagu). Lagu yang sedang diputar tidak dihentikan.")
+
+    @commands.group(name="playlist", invoke_without_command=True)
+    @commands.guild_only()
+    async def playlist_group(self, ctx: commands.Context):
+        await ctx.send("Gunakan `!playlist save <nama>`, `!playlist play <nama>`, `!playlist list`, atau `!playlist delete <nama>`." )
+
+    @playlist_group.command(name="save")
+    async def playlist_save(self, ctx: commands.Context, *, name: str):
+        player = self.get_player(ctx.guild.id)
+        if not player.queue and not player.current:
+            await ctx.send("Tidak ada lagu untuk disimpan.")
+            return
+        tracks = ([player.current] if player.current else []) + list(player.queue)
+        data = self._load_playlists()
+        guild_data = data.setdefault(str(ctx.guild.id), {})
+        guild_data[name.lower()] = [{"url": t.url, "title": t.title, "artist": t.artist, "webpage_url": t.webpage_url, "duration": t.duration, "duration_seconds": t.duration_seconds, "thumbnail": t.thumbnail, "license_url": t.license_url, "source": t.source} for t in tracks]
+        self._save_playlists(data)
+        await ctx.send(f"💾 Playlist **{discord.utils.escape_markdown(name)}** disimpan ({len(tracks)} lagu).")
+
+    @playlist_group.command(name="list")
+    async def playlist_list(self, ctx: commands.Context):
+        data = self._load_playlists().get(str(ctx.guild.id), {})
+        if not data:
+            await ctx.send("Belum ada playlist tersimpan di server ini.")
+            return
+        lines = [f"• **{discord.utils.escape_markdown(name)}** — {len(items)} lagu" for name, items in sorted(data.items())]
+        await ctx.send("📚 **Playlist server**\n" + "\n".join(lines[:30]))
+
+    @playlist_group.command(name="play")
+    async def playlist_play(self, ctx: commands.Context, *, name: str):
+        data = self._load_playlists().get(str(ctx.guild.id), {})
+        items = data.get(name.lower())
+        if not items:
+            await ctx.send("Playlist tidak ditemukan.")
+            return
+        voice = await self.connect_for_context(ctx)
+        if voice is None:
+            return
+        player = self.get_player(ctx.guild.id)
+        player.text_channel_id = ctx.channel.id
+        for item in items[:100]:
+            player.queue.append(Track(url=item["url"], title=item["title"], artist=item.get("artist"), requester_id=ctx.author.id, webpage_url=item.get("webpage_url"), duration=item.get("duration", "Durasi tidak diketahui"), duration_seconds=item.get("duration_seconds"), thumbnail=item.get("thumbnail"), license_url=item.get("license_url"), source=item.get("source", "Playlist")))
+        if not voice.is_playing() and not voice.is_paused() and player.current is None:
+            await self.start_next(ctx.guild.id)
+        await self.send_or_update_player(ctx)
+        await ctx.send(f"▶️ Playlist **{discord.utils.escape_markdown(name)}** ditambahkan ke antrean ({min(len(items),100)} lagu).")
+
+    @playlist_group.command(name="delete")
+    async def playlist_delete(self, ctx: commands.Context, *, name: str):
+        data = self._load_playlists()
+        guild_data = data.get(str(ctx.guild.id), {})
+        if guild_data.pop(name.lower(), None) is None:
+            await ctx.send("Playlist tidak ditemukan.")
+            return
+        self._save_playlists(data)
+        await ctx.send(f"🗑️ Playlist **{discord.utils.escape_markdown(name)}** dihapus.")
 
     @commands.command(name="shuffle")
     async def shuffle_command(self, ctx: commands.Context):
@@ -1830,7 +1994,8 @@ class Music(commands.Cog):
         embed = discord.Embed(title="🎵 FUMI MUSIC — HELP", color=PLAYER_COLOR)
         embed.add_field(
             name="Pemutaran",
-            value=("`!p <judul lagu>` — Cari di Internet Archive (mode tes)\n"
+            value=("`!p <judul lagu>` — Putar hasil terbaik\n"
+                   "`!search <judul>` — Pilih dari beberapa hasil\n"
                    "`!p <link track Jamendo>` — Putar track Jamendo\n"
                    "`!p <URL audio langsung>` — Putar stream yang diizinkan\n"
                    "`!queue` — Lihat antrean\n`!leave` — Keluar dari voice channel"),
@@ -1838,10 +2003,11 @@ class Music(commands.Cog):
         )
         embed.add_field(
             name="Kontrol player",
-            value="Gunakan tombol Previous, Stop, Pause/Resume, Skip, dan Repeat pada embed player.",
+            value="Tombol Previous, Stop, Pause/Resume, Skip, Repeat. Command: `!volume 80`, `!seek 1:30`.",
             inline=False,
         )
-        embed.add_field(name="Antrean", value="`!shuffle` — Acak antrean", inline=False)
+        embed.add_field(name="Antrean", value="`!queue`, `!shuffle`, `!remove 2`, `!move 2 1`, `!clear`", inline=False)
+        embed.add_field(name="Playlist", value="`!playlist save <nama>`, `!playlist play <nama>`, `!playlist list`, `!playlist delete <nama>`", inline=False)
         embed.add_field(
             name="Link yang didukung",
             value="Jamendo track URL dan URL audio langsung. Spotify digunakan untuk metadata lalu dicari di katalog berlisensi; audio Spotify/YouTube tidak diambil langsung.",
@@ -1852,7 +2018,7 @@ class Music(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        print("Fumi Music extension aktif (High Quality) — text search: Internet Archive only.")
+        print("Fumi Music extension aktif — Jamendo, Internet Archive, Audius; interactive search and playlists enabled.")
 
 
 async def setup(bot: commands.Bot):
