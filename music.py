@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import os
 import random
 import re
@@ -152,6 +153,23 @@ class Music(commands.Cog):
         self.audio_stats: dict[int, CountingPCMVolumeTransformer] = {}
 
     async def cog_load(self):
+        # Log the actual runtime packages so hosting logs can confirm the
+        # installed voice/DAVE dependencies after a restart.
+        try:
+            discord_version = importlib.metadata.version("discord.py")
+        except importlib.metadata.PackageNotFoundError:
+            discord_version = getattr(discord, "__version__", "unknown")
+        try:
+            davey_version = importlib.metadata.version("davey")
+            davey_status = f"installed ({davey_version})"
+        except importlib.metadata.PackageNotFoundError:
+            davey_status = "NOT INSTALLED"
+        try:
+            opus_status = "loaded" if discord.opus.is_loaded() else "not loaded"
+        except Exception:
+            opus_status = "check failed"
+
+        print(f"Fumi voice diagnostics: discord.py={discord_version}; davey={davey_status}; opus={opus_status}")
         self.progress_task = asyncio.create_task(self.progress_updater())
 
     def cog_unload(self):
@@ -538,7 +556,7 @@ class Music(commands.Cog):
             # FFmpeg decodes the authorized stream to PCM; discord.py encodes it as Opus
             # using the voice connection's negotiated bitrate/codec.
             before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-            options = "-vn -ac 2 -ar 48000"
+            options = "-vn"
             try:
                 source = CountingPCMVolumeTransformer(
                     discord.FFmpegPCMAudio(track.url, before_options=before_options, options=options),
@@ -787,6 +805,24 @@ class Music(commands.Cog):
             value="✅ Library Opus terdeteksi" if opus_loaded else "❌ Library Opus belum termuat",
             inline=False,
         )
+        # discord.py 2.7.1+ includes DAVE voice support; report runtime versions
+        # because an older already-installed package may remain on the host.
+        try:
+            discord_version = importlib.metadata.version("discord.py")
+        except importlib.metadata.PackageNotFoundError:
+            discord_version = getattr(discord, "__version__", "Tidak diketahui")
+        try:
+            davey_version = importlib.metadata.version("davey")
+            davey_status = f"✅ davey {davey_version}"
+        except importlib.metadata.PackageNotFoundError:
+            davey_status = "❌ Paket davey tidak terpasang"
+        try:
+            has_dave = getattr(discord.voice_client, "has_dave", None)
+            dave_support = "Tersedia" if has_dave is True else ("Tidak tersedia" if has_dave is False else "Tidak dapat dipastikan")
+        except Exception:
+            dave_support = "Tidak dapat diperiksa"
+        embed.add_field(name="discord.py version", value=f"`{discord_version}`", inline=True)
+        embed.add_field(name="DAVE support", value=f"{davey_status}\nRuntime: **{dave_support}**", inline=True)
         if voice is not None:
             try:
                 latency_text = f"{voice.latency * 1000:.0f} ms"
