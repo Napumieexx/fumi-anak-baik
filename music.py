@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import math
+import struct
 import os
 import random
 import re
@@ -25,18 +27,37 @@ ERROR_COLOR = discord.Color.orange()
 
 
 class CountingPCMVolumeTransformer(discord.PCMVolumeTransformer):
-    """PCM transformer that counts decoded audio frames for diagnostics."""
+    """Count PCM frames and measure signal energy without storing audio."""
     def __init__(self, original, volume: float = 1.0):
         super().__init__(original, volume=volume)
         self.frames_read = 0
         self.bytes_read = 0
+        self.samples_read = 0
+        self.sum_squares = 0
+        self.peak_abs = 0
+        self.silent_frames = 0
 
     def read(self) -> bytes:
         data = super().read()
         if data:
             self.frames_read += 1
             self.bytes_read += len(data)
+            usable = len(data) - (len(data) % 2)
+            if usable:
+                samples = struct.unpack("<" + "h" * (usable // 2), data[:usable])
+                peak = max(abs(sample) for sample in samples)
+                self.peak_abs = max(self.peak_abs, peak)
+                self.sum_squares += sum(sample * sample for sample in samples)
+                self.samples_read += len(samples)
+                if peak < 100:
+                    self.silent_frames += 1
         return data
+
+    @property
+    def rms(self) -> float:
+        if not self.samples_read:
+            return 0.0
+        return math.sqrt(self.sum_squares / self.samples_read)
 
 
 @dataclass
@@ -859,10 +880,18 @@ class Music(commands.Cog):
 
         stats = self.audio_stats.get(ctx.guild.id)
         if stats is not None:
+            silent_pct = (stats.silent_frames / stats.frames_read * 100) if stats.frames_read else 0.0
+            rms_pct = stats.rms / 32767 * 100
+            peak_pct = stats.peak_abs / 32767 * 100
             embed.add_field(
                 name="PCM frames terbaca",
-                value=f"{stats.frames_read:,} frame · {stats.bytes_read:,} byte",
-                inline=True,
+                value=(
+                    f"{stats.frames_read:,} frame · {stats.bytes_read:,} byte\n"
+                    f"RMS: **{stats.rms:.1f}** ({rms_pct:.2f}%)\n"
+                    f"Peak: **{stats.peak_abs}** ({peak_pct:.2f}%)\n"
+                    f"Frame hampir senyap: **{silent_pct:.1f}%**"
+                ),
+                inline=False,
             )
         else:
             embed.add_field(name="PCM frames terbaca", value="Belum ada data source aktif.", inline=True)
