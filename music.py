@@ -151,6 +151,7 @@ class Music(commands.Cog):
         self.jamendo_client_id = os.getenv("JAMENDO_CLIENT_ID")
         self.last_playback_error: dict[int, str] = {}
         self.audio_stats: dict[int, CountingPCMVolumeTransformer] = {}
+        self.voice_send_stats: dict[int, dict[str, int | str]] = {}
 
     async def cog_load(self):
         # Log the actual runtime packages so hosting logs can confirm the
@@ -510,6 +511,27 @@ class Music(commands.Cog):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
+    def instrument_voice_sender(self, guild_id: int, voice: discord.VoiceClient) -> None:
+        """Count send_audio_packet calls without exposing stream URLs or secrets."""
+        if getattr(voice, "_fumi_sender_instrumented", False):
+            return
+        original_send = voice.send_audio_packet
+        stats: dict[str, int | str] = {"attempts": 0, "returned": 0, "errors": 0, "last_error": ""}
+        self.voice_send_stats[guild_id] = stats
+
+        def counted_send(data: bytes, *, encode: bool = True) -> None:
+            stats["attempts"] = int(stats["attempts"]) + 1
+            try:
+                original_send(data, encode=encode)
+                stats["returned"] = int(stats["returned"]) + 1
+            except Exception as error:
+                stats["errors"] = int(stats["errors"]) + 1
+                stats["last_error"] = str(error)[:250]
+                raise
+
+        voice.send_audio_packet = counted_send  # type: ignore[method-assign]
+        voice._fumi_sender_instrumented = True  # type: ignore[attr-defined]
+
     async def connect_for_context(self, ctx: commands.Context) -> discord.VoiceClient | None:
         if not ctx.guild:
             await ctx.send("Command musik hanya bisa digunakan di server.")
@@ -523,6 +545,7 @@ class Music(commands.Cog):
                 voice = await ctx.author.voice.channel.connect()
             elif voice.channel != ctx.author.voice.channel:
                 await voice.move_to(ctx.author.voice.channel)
+            self.instrument_voice_sender(ctx.guild.id, voice)
             return voice
         except (discord.Forbidden, discord.HTTPException) as error:
             await ctx.send(f"Fumi gagal bergabung ke voice channel: `{error}`")
@@ -829,6 +852,19 @@ class Music(commands.Cog):
             except Exception:
                 latency_text = "Tidak tersedia"
             embed.add_field(name="Voice latency", value=latency_text, inline=True)
+
+        send_stats = self.voice_send_stats.get(ctx.guild.id)
+        if send_stats is not None:
+            send_text = (
+                f"Attempts: **{send_stats['attempts']:,}**\n"
+                f"Returned: **{send_stats['returned']:,}**\n"
+                f"Errors: **{send_stats['errors']:,}**"
+            )
+            if send_stats.get("last_error"):
+                send_text += f"\nLast error: `{str(send_stats['last_error'])[:180]}`"
+        else:
+            send_text = "Belum terpasang; jalankan `!p` setelah update lalu cek lagi."
+        embed.add_field(name="Discord audio send", value=send_text, inline=False)
 
         stats = self.audio_stats.get(ctx.guild.id)
         if stats is not None:
