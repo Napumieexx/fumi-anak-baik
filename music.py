@@ -19,7 +19,7 @@ from discord.ext import commands
 
 
 # Fumi Music - High Quality player
-# Search playback uses Jamendo API stream URLs; direct authorized audio URLs are also supported.
+# Search playback uses licensed Jamendo/Internet Archive streams; direct authorized audio URLs are also supported.
 # Spotify/YouTube page URLs are not extracted or ripped.
 
 PLAYER_COLOR = discord.Color.from_rgb(35, 190, 120)
@@ -322,22 +322,47 @@ class Music(commands.Cog):
 
     @staticmethod
     def _match_score(query: str, title: str | None, artist: str | None = None) -> float:
-        """Skor ringan untuk memilih hasil yang paling relevan; tidak mengubah lisensi."""
+        """Nilai kecocokan judul/artis; query 'judul - artis' wajib cocok pada keduanya."""
         from difflib import SequenceMatcher
-        q = re.sub(r"[^\w\s]", " ", query.casefold())
-        q = re.sub(r"\s+", " ", q).strip()
-        title_clean = re.sub(r"[^\w\s]", " ", (title or "").casefold())
-        title_clean = re.sub(r"\s+", " ", title_clean).strip()
-        candidate = " ".join(x for x in [title or "", artist or ""] if x)
-        candidate = re.sub(r"[^\w\s]", " ", candidate.casefold())
-        candidate = re.sub(r"\s+", " ", candidate).strip()
-        if not q or not candidate:
+
+        def norm(value: str | None) -> str:
+            value = (value or "").casefold()
+            value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+            return re.sub(r"\s+", " ", value).strip()
+
+        q_raw = query.strip()
+        title_n = norm(title)
+        artist_n = norm(artist)
+        if not q_raw or not title_n:
             return 0.0
-        # Judul saja tetap bisa mendapat skor penuh meskipun query tidak menyebut artis.
-        return max(
-            SequenceMatcher(None, q, title_clean).ratio(),
-            SequenceMatcher(None, q, candidate).ratio(),
-        )
+
+        def similarity(a: str, b: str) -> float:
+            if not a or not b:
+                return 0.0
+            seq = SequenceMatcher(None, a, b).ratio()
+            at, bt = set(a.split()), set(b.split())
+            overlap = len(at & bt) / max(1, len(at))
+            return max(seq, overlap)
+
+        # Format eksplisit: "judul - artis". Jangan biarkan judul mirip
+        # menutupi artis yang sama sekali berbeda.
+        parts = re.split(r"\s+-\s+", q_raw, maxsplit=1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            wanted_title = norm(parts[0])
+            wanted_artist = norm(parts[1])
+            title_score = similarity(wanted_title, title_n)
+            artist_score = similarity(wanted_artist, artist_n)
+            if artist_score < 0.55:
+                return 0.0
+            return (title_score * 0.72) + (artist_score * 0.28)
+
+        q = norm(q_raw)
+        title_score = similarity(q, title_n)
+        # Artist membantu pencarian, tetapi tidak boleh menggantikan kecocokan judul.
+        artist_score = similarity(q, artist_n)
+        combined = norm(f"{title or ''} {artist or ''}")
+        combined_score = similarity(q, combined)
+        return max(title_score, min(combined_score, 0.82), artist_score * 0.65)
 
     async def search_jamendo(self, query: str, track_id: str | None = None) -> Track | None:
         """Cari beberapa variasi judul/artis di katalog Jamendo dan ambil stream resmi."""
@@ -407,7 +432,7 @@ class Music(commands.Cog):
 
         # Jangan mengembalikan hasil acak: pilih kecocokan tertinggi, dengan URL audio resmi.
         best_score, item = max(candidates.values(), key=lambda pair: pair[0])
-        if best_score < 0.38:
+        if best_score < 0.68:
             return None
         duration = int(item.get("duration") or 0)
         license_url = item.get("license_ccurl")
@@ -470,6 +495,11 @@ class Music(commands.Cog):
             )
 
             for doc in ranked_docs[:40]:
+                creator_value = doc.get("creator")
+                creator_text = creator_value if isinstance(creator_value, str) else " ".join(creator_value or [])
+                match_score = self._match_score(query, doc.get("title"), creator_text)
+                if match_score < 0.68:
+                    continue
                 identifier = doc.get("identifier")
                 license_url = doc.get("licenseurl") or ""
                 if not identifier or not (
