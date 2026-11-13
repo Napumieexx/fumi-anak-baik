@@ -998,6 +998,131 @@ class Music(commands.Cog):
         embed.set_footer(text="Diagnostik tidak menampilkan URL stream atau rahasia konfigurasi.")
         await ctx.send(embed=embed)
 
+    @commands.command(name="voiceprobe", aliases=["vprobe", "cekvoice"])
+    @commands.guild_only()
+    async def voice_probe_command(self, ctx: commands.Context):
+        """Tes inti Opus, DAVE, Voice Client, dan jalur audio; hasil dikirim ke channel."""
+        voice = ctx.guild.voice_client
+        player = self.get_player(ctx.guild.id)
+
+        embed = discord.Embed(
+            title="🔎 FUMI VOICE CORE PROBE",
+            color=PLAYER_COLOR,
+        )
+
+        if voice is None or not voice.is_connected():
+            embed.add_field(
+                name="Voice connection",
+                value="❌ Tidak terhubung. Jalankan !afkvoice atau !p terlebih dahulu.",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+
+        # 1) Uji encoder Opus sungguhan, bukan hanya cek library terpasang.
+        try:
+            opus_loaded = discord.opus.is_loaded()
+        except Exception:
+            opus_loaded = False
+
+        if opus_loaded:
+            try:
+                encoder = discord.opus.Encoder()
+                encoded = encoder.encode(bytes(3840), 960)  # 20 ms, 48 kHz, stereo PCM
+                opus_result = f"✅ Encode berhasil ({len(encoded)} byte)"
+                try:
+                    encoder = None
+                except Exception:
+                    pass
+            except Exception as error:
+                opus_result = f"❌ Encode gagal: {type(error).__name__}: {str(error)[:180]}"
+        else:
+            opus_result = "❌ discord.opus.is_loaded() = False"
+
+        embed.add_field(name="1. Opus encode test", value=opus_result, inline=False)
+
+        # 2) Periksa status DAVE tanpa menampilkan objek/kunci rahasia.
+        state = getattr(voice, "_connection", None)
+        session = getattr(state, "dave_session", None) if state else None
+        can_encrypt = getattr(state, "can_encrypt", None) if state else None
+        protocol = getattr(state, "dave_protocol_version", None) if state else None
+        downgraded = getattr(state, "dave_downgraded", None) if state else None
+        mode = getattr(state, "mode", None) if state else None
+
+        ready_checks = []
+        if session is not None:
+            for attr in ("ready", "is_ready", "_ready"):
+                try:
+                    value = getattr(session, attr, None)
+                    if callable(value):
+                        value = value()
+                    if isinstance(value, (bool, int, str)):
+                        ready_checks.append(f"{attr}={value}")
+                except Exception:
+                    ready_checks.append(f"{attr}=error")
+
+        dave_lines = [
+            f"Session object: **{'ada' if session is not None else 'tidak ada'}**",
+            f"Can encrypt: **{can_encrypt if can_encrypt is not None else 'unknown'}**",
+            f"Protocol: **{protocol if protocol is not None else 'unknown'}**",
+            f"Downgraded: **{downgraded if downgraded is not None else 'unknown'}**",
+            f"Mode: `{mode if mode is not None else 'unknown'}`",
+        ]
+        if ready_checks:
+            dave_lines.append("Session readiness: `" + ", ".join(ready_checks) + "`")
+        embed.add_field(name="2. DAVE encryption state", value="\n".join(dave_lines), inline=False)
+
+        # 3) Socket dan status player. UDP success bukan bukti bahwa pendengar menerima audio.
+        sock = getattr(state, "socket", None) if state else None
+        try:
+            socket_open = bool(sock and sock.fileno() >= 0)
+        except Exception:
+            socket_open = False
+
+        source = getattr(voice, "source", None)
+        try:
+            source_is_opus = bool(source and source.is_opus())
+        except Exception:
+            source_is_opus = None
+
+        playback_lines = [
+            f"Connected: **{voice.is_connected()}**",
+            f"Playing: **{voice.is_playing()}**",
+            f"Paused: **{voice.is_paused()}**",
+            f"UDP socket open: **{socket_open}**",
+            f"Audio source: `{type(source).__name__ if source is not None else 'none'}`",
+            f"Source already Opus: **{source_is_opus if source_is_opus is not None else 'unknown'}**",
+        ]
+        embed.add_field(name="3. Voice playback path", value="\n".join(playback_lines), inline=False)
+
+        # 4) Tampilkan penghitung kirim terakhir yang sudah dikumpulkan extension.
+        send = self.voice_send_stats.get(ctx.guild.id, {})
+        if send:
+            send_lines = [
+                f"Audio calls: **{send.get('attempts', 0):,}**",
+                f"UDP attempts: **{send.get('udp_attempts', 0):,}**",
+                f"UDP send success: **{send.get('udp_sent', 0):,}**",
+                f"UDP send errors: **{send.get('udp_errors', 0):,}**",
+            ]
+        else:
+            send_lines = ["Belum ada statistik pengiriman; mulai putar lagu setelah bot tersambung."]
+        embed.add_field(name="4. Send counters", value="\n".join(send_lines), inline=False)
+
+        # 5) Beri kesimpulan otomatis berdasarkan pemeriksaan inti.
+        if not opus_loaded or "Encode gagal" in opus_result:
+            verdict = "❌ **Masalah encoder Opus lokal.** Perbaiki pemuatan/library Opus terlebih dahulu."
+        elif can_encrypt is False:
+            verdict = "❌ **DAVE belum siap (`can_encrypt=False`).** Ini titik kegagalan utama yang terlihat; UDP/PCM yang normal tidak membuktikan paket dapat didekripsi Discord."
+        elif can_encrypt is None:
+            verdict = "⚠️ Status DAVE tidak dapat dibaca dari Voice Client ini. Perlu log transisi DAVE yang lebih spesifik."
+        elif not voice.is_playing() and not voice.is_paused():
+            verdict = "⚠️ Tidak ada audio yang sedang diputar saat probe dijalankan."
+        else:
+            verdict = "🟡 Opus dan status enkripsi tampak siap. Jika tetap tidak terdengar, perlu uji penerimaan di klien Discord/packet-level; angka UDP lokal saja tidak cukup."
+        embed.add_field(name="Kesimpulan probe", value=verdict, inline=False)
+        embed.set_footer(text="Jalankan saat lagu sedang diputar. Tidak menampilkan URL, token, atau kunci.")
+        await ctx.send(embed=embed)
+
     @commands.command(name="help", aliases=["musichelp", "mhelp"])
     async def music_help_command(self, ctx: commands.Context):
         embed = discord.Embed(title="🎵 FUMI MUSIC — HELP", color=PLAYER_COLOR)
