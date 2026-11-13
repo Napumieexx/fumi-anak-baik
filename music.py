@@ -33,6 +33,7 @@ class Track:
     thumbnail: str | None = None
     artist: str | None = None
     license_url: str | None = None
+    source: str = "Direct audio"
 
 
 @dataclass
@@ -224,11 +225,11 @@ class Music(commands.Cog):
         else:
             queue_text = "Tidak ada lagu berikutnya."
         embed.add_field(name=f"Up Next · {len(player.queue)} lagu", value=queue_text, inline=False)
-        embed.add_field(name="Audio", value="High Quality · Jamendo MP3 VBR / Opus voice", inline=True)
+        embed.add_field(name="Audio", value=f"{track.source} · Opus voice", inline=True)
         if track.license_url:
             embed.add_field(name="License", value=f"[Info lisensi]({track.license_url})", inline=True)
         embed.add_field(name="Repeat", value="Aktif" if player.repeat else "Nonaktif", inline=True)
-        embed.set_footer(text="Fumi Music • !shuffle untuk mengacak antrean")
+        embed.set_footer(text="Fumi Music • Multi-source audio • !shuffle untuk mengacak antrean")
         return embed
 
     async def search_jamendo(self, query: str, track_id: str | None = None) -> Track | None:
@@ -255,7 +256,7 @@ class Music(commands.Cog):
                     "include": "licenses",
                     # API secara default hanya mengembalikan track album.
                     # Sertakan single juga agar hasil pencarian lebih lengkap.
-                    "track_type": "single albumtrack",
+                    "type": "single albumtrack",
                 }
                 if track_id:
                     params["id"] = track_id
@@ -315,11 +316,121 @@ class Music(commands.Cog):
                     duration_seconds=duration or None,
                     thumbnail=item.get("image") or item.get("album_image"),
                     license_url=license_url,
+                    source="Jamendo",
                 )
 
         if last_error:
             raise RuntimeError(f"Gagal menghubungi katalog Jamendo: {last_error}") from last_error
         return None
+
+    async def search_internet_archive(self, query: str) -> Track | None:
+        """Cari audio Internet Archive hanya jika item mencantumkan lisensi yang jelas."""
+        timeout = aiohttp.ClientTimeout(total=18)
+        safe_query = query.replace('"', ' ').strip()
+        if not safe_query:
+            return None
+
+        search_url = "https://archive.org/advancedsearch.php"
+        params = {
+            "q": f'mediatype:audio AND (title:"{safe_query}" OR creator:"{safe_query}")',
+            "fl[]": ["identifier", "title", "creator", "licenseurl"],
+            "rows": 8,
+            "page": 1,
+            "output": "json",
+        }
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(search_url, params=params) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Internet Archive search HTTP {response.status}")
+                data = await response.json(content_type=None)
+
+            docs = data.get("response", {}).get("docs", [])
+            for doc in docs:
+                identifier = doc.get("identifier")
+                license_url = doc.get("licenseurl") or ""
+                # Jangan putar item tanpa lisensi yang dapat diverifikasi.
+                if not identifier or not (
+                    "creativecommons.org/licenses/" in license_url
+                    or "creativecommons.org/publicdomain/" in license_url
+                ):
+                    continue
+
+                metadata_url = f"https://archive.org/metadata/{identifier}"
+                async with session.get(metadata_url) as response:
+                    if response.status != 200:
+                        continue
+                    metadata = await response.json(content_type=None)
+
+                files = metadata.get("files", [])
+                candidates = []
+                for file_info in files:
+                    name = file_info.get("name", "")
+                    fmt = (file_info.get("format") or "").lower()
+                    lower_name = name.lower()
+                    if lower_name.endswith(".mp3") and "original" not in lower_name and "_spectrogram" not in lower_name:
+                        size = int(file_info.get("size") or 0)
+                        candidates.append((size, name))
+                    elif fmt in {"mp3", "vbr mp3"} and lower_name.endswith(".mp3"):
+                        size = int(file_info.get("size") or 0)
+                        candidates.append((size, name))
+
+                if not candidates:
+                    continue
+                # Pilih file MP3 terbesar agar tidak mengambil thumbnail/preview kecil.
+                _, filename = max(candidates, key=lambda item: item[0])
+                from urllib.parse import quote
+                audio_url = f"https://archive.org/download/{identifier}/{quote(filename, safe='/')}"
+                creator = doc.get("creator")
+                if isinstance(creator, list):
+                    creator = ", ".join(str(x) for x in creator[:2])
+                duration = None
+                return Track(
+                    url=audio_url,
+                    title=doc.get("title") or query,
+                    artist=creator if isinstance(creator, str) else None,
+                    requester_id=0,
+                    webpage_url=f"https://archive.org/details/{identifier}",
+                    duration="Durasi tidak diketahui",
+                    duration_seconds=duration,
+                    license_url=license_url,
+                    source="Internet Archive",
+                )
+        return None
+
+    async def search_multi_source(self, query: str) -> Track | None:
+        """Cari berurutan di katalog yang menyediakan URL audio dan lisensi."""
+        errors = []
+        try:
+            track = await self.search_jamendo(query)
+            if track:
+                return track
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
+            errors.append(f"Jamendo: {error}")
+
+        try:
+            track = await self.search_internet_archive(query)
+            if track:
+                return track
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
+            errors.append(f"Internet Archive: {error}")
+
+        if errors:
+            print("Fumi multi-source search: " + " | ".join(errors))
+        return None
+
+    async def spotify_oembed_title(self, url: str) -> str | None:
+        """Ambil judul publik dari oEmbed Spotify; tidak mengambil audio Spotify."""
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://open.spotify.com/oembed", params={"url": url}
+            ) as response:
+                if response.status != 200:
+                    return None
+                data = await response.json(content_type=None)
+                title = data.get("title")
+                return title.strip() if isinstance(title, str) and title.strip() else None
 
     async def lookup_track_metadata(self, track: Track):
         """Cari cover dan metadata katalog berdasarkan nama file/track yang terbaca dari URL."""
@@ -482,18 +593,44 @@ class Music(commands.Cog):
         lowered = query.lower().strip()
         is_youtube = "youtube.com/" in lowered or "youtu.be/" in lowered
         is_spotify = "open.spotify.com/" in lowered
-        if is_youtube or is_spotify:
-            platform = "YouTube" if is_youtube else "Spotify"
+        if is_youtube:
             await ctx.send(
-                f"Link {platform} berhasil dikenali, tetapi halaman tersebut bukan URL stream audio. "
-                "Fumi tidak mengambil/ripping audio dari sana. Kirim judul lagu untuk mencari versi "
-                "yang tersedia di Jamendo, atau gunakan link audio langsung yang memang mengizinkan streaming bot."
+                "Link YouTube dikenali, tetapi Fumi tidak mengambil audio dari halaman tersebut. "
+                "Kirim judul lagu atau URL audio yang memang mengizinkan streaming bot."
             )
             return
 
+        if is_spotify:
+            status = await ctx.send("🔎 Membaca metadata Spotify, lalu mencari versi audio berlisensi...")
+            try:
+                spotify_title = await self.spotify_oembed_title(query)
+                if not spotify_title:
+                    await status.edit(content=(
+                        "❌ Metadata Spotify tidak dapat dibaca. Kirim judul lagu dan artisnya "
+                        "agar Fumi bisa mencari di katalog audio yang tersedia."
+                    ))
+                    return
+                track = await self.search_multi_source(spotify_title)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
+                await status.edit(content=f"❌ Pencarian sumber audio gagal: `{error}`")
+                return
+            if track is None:
+                await status.edit(content=(
+                    f"Lagu **{discord.utils.escape_markdown(spotify_title)}** tidak ditemukan "
+                    "di sumber audio berlisensi yang tersedia. Spotify hanya dipakai untuk metadata, bukan audio."
+                ))
+                return
+            track.requester_id = ctx.author.id
+            try:
+                await status.delete()
+            except discord.HTTPException:
+                pass
+
         # Link halaman track Jamendo dapat di-resolve melalui API resmi Jamendo.
         jamendo_match = re.search(r"jamendo\.com/(?:[a-z]{2}/)?track/(\d+)", lowered)
-        if jamendo_match:
+        if is_spotify:
+            pass  # Track sudah ditemukan melalui metadata Spotify + katalog audio berlisensi.
+        elif jamendo_match:
             status = await ctx.send("🔎 Membuka track Jamendo...")
             try:
                 track = await self.search_jamendo(query, track_id=jamendo_match.group(1))
@@ -514,15 +651,15 @@ class Music(commands.Cog):
             )
             await self.lookup_track_metadata(track)
         else:
-            status = await ctx.send(f"🔎 Mencari **{discord.utils.escape_markdown(query)}** di katalog Jamendo...")
+            status = await ctx.send(f"🔎 Mencari **{discord.utils.escape_markdown(query)}** di beberapa katalog audio...")
             try:
-                track = await self.search_jamendo(query)
+                track = await self.search_multi_source(query)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
                 await status.edit(content=f"❌ Pencarian musik gagal: `{error}`")
                 return
             if track is None:
                 await status.edit(
-                    content="Tidak menemukan lagu dengan stream yang tersedia. Coba judul atau nama artis lain."
+                    content="Tidak menemukan audio berlisensi yang cocok di katalog Fumi. Coba judul + nama artis lain."
                 )
                 return
             track.requester_id = ctx.author.id
@@ -600,7 +737,7 @@ class Music(commands.Cog):
         embed = discord.Embed(title="🎵 FUMI MUSIC — HELP", color=PLAYER_COLOR)
         embed.add_field(
             name="Pemutaran",
-            value=("`!p <judul lagu>` — Cari dan putar dari Jamendo\n"
+            value=("`!p <judul lagu>` — Cari di Jamendo dan Internet Archive\n"
                    "`!p <link track Jamendo>` — Putar track Jamendo\n"
                    "`!p <URL audio langsung>` — Putar stream yang diizinkan\n"
                    "`!queue` — Lihat antrean\n`!leave` — Keluar dari voice channel"),
@@ -614,7 +751,7 @@ class Music(commands.Cog):
         embed.add_field(name="Antrean", value="`!shuffle` — Acak antrean", inline=False)
         embed.add_field(
             name="Link yang didukung",
-            value="Jamendo track URL dan URL audio langsung. Link halaman Spotify/YouTube hanya dikenali, bukan diputar langsung.",
+            value="Jamendo track URL dan URL audio langsung. Spotify digunakan untuk metadata lalu dicari di katalog berlisensi; audio Spotify/YouTube tidak diambil langsung.",
             inline=False,
         )
         embed.set_footer(text="High Quality • Jamendo + URL audio langsung yang diizinkan")
