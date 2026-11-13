@@ -19,7 +19,7 @@ from discord.ext import commands
 
 
 # Fumi Music - High Quality player
-# Search playback uses licensed Jamendo/Internet Archive streams; direct authorized audio URLs are also supported.
+# Search playback uses Jamendo API stream URLs; direct authorized audio URLs are also supported.
 # Spotify/YouTube page URLs are not extracted or ripped.
 
 PLAYER_COLOR = discord.Color.from_rgb(35, 190, 120)
@@ -322,7 +322,7 @@ class Music(commands.Cog):
 
     @staticmethod
     def _match_score(query: str, title: str | None, artist: str | None = None) -> float:
-        """Nilai kecocokan judul/artis; query 'judul - artis' wajib cocok pada keduanya."""
+        """Strict title/artist matching. Rejects results that only share one generic word."""
         from difflib import SequenceMatcher
 
         def norm(value: str | None) -> str:
@@ -330,39 +330,64 @@ class Music(commands.Cog):
             value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
             return re.sub(r"\s+", " ", value).strip()
 
-        q_raw = query.strip()
-        title_n = norm(title)
-        artist_n = norm(artist)
-        if not q_raw or not title_n:
+        def compact(value: str | None) -> str:
+            return re.sub(r"\s+", "", norm(value))
+
+        q = norm(query)
+        t = norm(title)
+        a = norm(artist)
+        if not q or not t:
             return 0.0
 
-        def similarity(a: str, b: str) -> float:
-            if not a or not b:
+        # Explicit "title - artist" form: both fields must match.
+        explicit = re.split(r"\s+-\s+", query.strip(), maxsplit=1)
+        if len(explicit) == 2 and explicit[0].strip() and explicit[1].strip():
+            wanted_title = norm(explicit[0])
+            wanted_artist = norm(explicit[1])
+            title_score = max(
+                SequenceMatcher(None, wanted_title, t).ratio(),
+                len(set(wanted_title.split()) & set(t.split())) / max(1, len(set(wanted_title.split()))),
+            )
+            artist_score = max(
+                SequenceMatcher(None, compact(wanted_artist), compact(artist)).ratio(),
+                len(set(wanted_artist.split()) & set(a.split())) / max(1, len(set(wanted_artist.split()))),
+            )
+            if title_score < 0.68 or artist_score < 0.60:
                 return 0.0
-            seq = SequenceMatcher(None, a, b).ratio()
-            at, bt = set(a.split()), set(b.split())
-            overlap = len(at & bt) / max(1, len(at))
-            return max(seq, overlap)
+            return 0.72 * title_score + 0.28 * artist_score
 
-        # Format eksplisit: "judul - artis". Jangan biarkan judul mirip
-        # menutupi artis yang sama sekali berbeda.
-        parts = re.split(r"\s+-\s+", q_raw, maxsplit=1)
-        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-            wanted_title = norm(parts[0])
-            wanted_artist = norm(parts[1])
-            title_score = similarity(wanted_title, title_n)
-            artist_score = similarity(wanted_artist, artist_n)
-            if artist_score < 0.55:
-                return 0.0
-            return (title_score * 0.72) + (artist_score * 0.28)
+        q_tokens = q.split()
+        t_tokens = set(t.split())
+        a_tokens = set(a.split())
+        t_compact = compact(title)
+        a_compact = compact(artist)
 
-        q = norm(q_raw)
-        title_score = similarity(q, title_n)
-        # Artist membantu pencarian, tetapi tidak boleh menggantikan kecocokan judul.
-        artist_score = similarity(q, artist_n)
-        combined = norm(f"{title or ''} {artist or ''}")
-        combined_score = similarity(q, combined)
-        return max(title_score, min(combined_score, 0.82), artist_score * 0.65)
+        # A token may match a compact artist spelling (e.g. "yungkai" vs "yung kai").
+        matched = 0
+        title_hits = 0
+        artist_hits = 0
+        for token in q_tokens:
+            in_title = token in t_tokens or (len(token) >= 5 and token in t_compact)
+            in_artist = token in a_tokens or (len(token) >= 5 and token in a_compact)
+            if in_title or in_artist:
+                matched += 1
+            if in_title:
+                title_hits += 1
+            if in_artist:
+                artist_hits += 1
+
+        coverage = matched / max(1, len(q_tokens))
+        title_coverage = title_hits / max(1, len(q_tokens))
+        title_similarity = SequenceMatcher(None, q, t).ratio()
+
+        # For multiword requests, require most query words to appear in title+artist.
+        # This blocks "Wildflower Harp" by an unrelated creator for "Wildflower yung kai".
+        if len(q_tokens) > 1 and coverage < 0.67:
+            return 0.0
+        if title_coverage == 0 and title_similarity < 0.72:
+            return 0.0
+
+        return 0.72 * coverage + 0.28 * max(title_coverage, title_similarity)
 
     async def search_jamendo(self, query: str, track_id: str | None = None) -> Track | None:
         """Cari beberapa variasi judul/artis di katalog Jamendo dan ambil stream resmi."""
@@ -497,8 +522,7 @@ class Music(commands.Cog):
             for doc in ranked_docs[:40]:
                 creator_value = doc.get("creator")
                 creator_text = creator_value if isinstance(creator_value, str) else " ".join(creator_value or [])
-                match_score = self._match_score(query, doc.get("title"), creator_text)
-                if match_score < 0.68:
+                if self._match_score(query, doc.get("title"), creator_text) < 0.68:
                     continue
                 identifier = doc.get("identifier")
                 license_url = doc.get("licenseurl") or ""
@@ -874,23 +898,39 @@ class Music(commands.Cog):
         if voice.is_playing() or voice.is_paused() or player.current is not None:
             player.queue.append(track)
             await ctx.send(f"➕ **Ditambahkan ke antrean:** {discord.utils.escape_markdown(track.title)}")
-            await self.refresh_player(ctx.guild.id)
+            # Setiap !p memindahkan player card terbaru ke bagian paling bawah channel.
+            await self.send_or_update_player(ctx)
         else:
             player.queue.append(track)
             await self.start_next(ctx.guild.id)
             await self.send_or_update_player(ctx)
 
     async def send_or_update_player(self, ctx: commands.Context):
+        """Kirim player card baru di bawah, lalu hapus card lama agar channel tetap rapi."""
         player = self.get_player(ctx.guild.id)
+        old_message = player.message
         view = FumiPlayerView(self, ctx.guild.id)
         player.view = view
-        if player.message:
+
+        # Kirim dahulu agar UI lama tidak hilang bila pengiriman pesan baru gagal.
+        new_message = await ctx.send(embed=self.make_embed(ctx.guild.id), view=view)
+        player.message = new_message
+
+        if old_message is not None:
             try:
-                await player.message.edit(embed=self.make_embed(ctx.guild.id), view=view)
-                return
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                player.message = None
-        player.message = await ctx.send(embed=self.make_embed(ctx.guild.id), view=view)
+                await old_message.delete()
+            except discord.NotFound:
+                pass
+            except (discord.Forbidden, discord.HTTPException):
+                # Jika Discord menolak penghapusan, matikan tombol lama dan bersihkan embed-nya.
+                try:
+                    await old_message.edit(
+                        content="↪️ Player telah diperbarui di bawah.",
+                        embed=None,
+                        view=None,
+                    )
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
 
     @commands.command(name="shuffle")
     async def shuffle_command(self, ctx: commands.Context):
