@@ -1072,7 +1072,24 @@ class Music(commands.Cog):
                         "agar Fumi bisa mencari di katalog audio yang tersedia."
                     ))
                     return
-                track = await self.search_multi_source(spotify_title)
+                # Spotify oEmbed titles often look like "happy - Gustixa Remix".
+                # The suffix is frequently a remix/version label, not the artist name.
+                # Convert it to a neutral token query so the metadata providers can
+                # resolve the real title and artist instead of treating "Gustixa Remix"
+                # as a literal artist field.
+                spotify_search_query = re.sub(
+                    r"\s*[-–—]\s*(?=.*\b(?:remix|edit|version|sped\s*up|slowed|nightcore)\b)",
+                    " ",
+                    spotify_title,
+                    flags=re.IGNORECASE,
+                )
+                spotify_search_query = re.sub(
+                    r"\s*[-–—]\s*",
+                    " ",
+                    spotify_search_query,
+                )
+                spotify_search_query = re.sub(r"\s+", " ", spotify_search_query).strip()
+                track = await self.search_multi_source(spotify_search_query or spotify_title)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
                 await status.edit(content=f"❌ Pencarian sumber audio gagal: `{error}`")
                 return
