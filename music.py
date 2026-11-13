@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -13,9 +14,9 @@ import discord
 from discord.ext import commands
 
 
-# Fumi Music - High Quality direct-stream player
-# Playback accepts direct audio-stream URLs from sources that authorize bot playback.
-# It intentionally does not extract/rip audio from Spotify or YouTube URLs.
+# Fumi Music - High Quality player
+# Search playback uses Jamendo API stream URLs; direct authorized audio URLs are also supported.
+# Spotify/YouTube page URLs are not extracted or ripped.
 
 PLAYER_COLOR = discord.Color.from_rgb(35, 190, 120)
 ERROR_COLOR = discord.Color.orange()
@@ -31,6 +32,7 @@ class Track:
     duration_seconds: int | None = None
     thumbnail: str | None = None
     artist: str | None = None
+    license_url: str | None = None
 
 
 @dataclass
@@ -128,6 +130,7 @@ class Music(commands.Cog):
         self.bot = bot
         self.players: dict[int, GuildPlayer] = defaultdict(GuildPlayer)
         self.progress_task: asyncio.Task | None = None
+        self.jamendo_client_id = os.getenv("JAMENDO_CLIENT_ID")
 
     async def cog_load(self):
         self.progress_task = asyncio.create_task(self.progress_updater())
@@ -179,7 +182,7 @@ class Music(commands.Cog):
         if track is None:
             embed = discord.Embed(
                 title="🎵 FUMI MUSIC PLAYER",
-                description="Belum ada lagu yang diputar. Gunakan `!p <URL audio langsung>` untuk memulai.",
+                description="Belum ada lagu yang diputar. Gunakan `!p <judul lagu>` atau URL audio langsung.",
                 color=PLAYER_COLOR,
             )
             embed.add_field(name="Queue", value=f"{len(player.queue)} lagu", inline=True)
@@ -221,10 +224,68 @@ class Music(commands.Cog):
         else:
             queue_text = "Tidak ada lagu berikutnya."
         embed.add_field(name=f"Up Next · {len(player.queue)} lagu", value=queue_text, inline=False)
-        embed.add_field(name="Audio", value="High Quality · Opus / voice channel", inline=True)
+        embed.add_field(name="Audio", value="High Quality · FLAC source / Opus voice", inline=True)
+        if track.license_url:
+            embed.add_field(name="License", value=f"[Info lisensi]({track.license_url})", inline=True)
         embed.add_field(name="Repeat", value="Aktif" if player.repeat else "Nonaktif", inline=True)
         embed.set_footer(text="Fumi Music • !shuffle untuk mengacak antrean")
         return embed
+
+    async def search_jamendo(self, query: str, track_id: str | None = None) -> Track | None:
+        """Cari lagu atau resolve link track Jamendo ke stream resmi dari API."""
+        if not self.jamendo_client_id:
+            raise RuntimeError(
+                "JAMENDO_CLIENT_ID belum diatur. Buat client ID Jamendo lalu masukkan ke file .env."
+            )
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        params = {
+            "client_id": self.jamendo_client_id,
+            "format": "json",
+            "limit": 5,
+            "audioformat": "flac",
+            "imagesize": 500,
+            "include": "licenses",
+        }
+        if track_id:
+            params["id"] = track_id
+        else:
+            params["search"] = query
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://api.jamendo.com/v3.0/tracks/", params=params) as response:
+                if response.status != 200:
+                    body = (await response.text())[:300]
+                    raise RuntimeError(f"Jamendo API mengembalikan HTTP {response.status}: {body}")
+                data = await response.json(content_type=None)
+
+        headers = data.get("headers", {})
+        if headers.get("status") != "success":
+            raise RuntimeError(headers.get("error_message") or "Pencarian Jamendo gagal.")
+
+        results = data.get("results") or []
+        # Pilih hasil pertama yang benar-benar memiliki stream audio.
+        item = next((row for row in results if row.get("audio")), None)
+        if not item:
+            return None
+
+        duration = int(item.get("duration") or 0)
+        license_url = item.get("license_ccurl")
+        if not license_url:
+            licenses = item.get("licenses") or []
+            if licenses and isinstance(licenses[0], dict):
+                license_url = licenses[0].get("url")
+
+        return Track(
+            url=item["audio"],
+            title=item.get("name") or query,
+            artist=item.get("artist_name"),
+            requester_id=0,
+            webpage_url=item.get("shareurl") or item.get("shorturl"),
+            duration=self._format_time(duration) if duration else "Durasi tidak diketahui",
+            duration_seconds=duration or None,
+            thumbnail=item.get("image") or item.get("album_image"),
+            license_url=license_url,
+        )
 
     async def lookup_track_metadata(self, track: Track):
         """Cari cover dan metadata katalog berdasarkan nama file/track yang terbaca dari URL."""
@@ -382,25 +443,74 @@ class Music(commands.Cog):
 
     @commands.command(name="p", aliases=["play"])
     async def play_command(self, ctx: commands.Context, *, query: str):
-        if not self._is_direct_url(query):
+        if ctx.guild is None:
+            await ctx.send("Command musik hanya bisa digunakan di server.")
+            return
+
+        lowered = query.lower().strip()
+        is_youtube = "youtube.com/" in lowered or "youtu.be/" in lowered
+        is_spotify = "open.spotify.com/" in lowered
+        if is_youtube or is_spotify:
+            platform = "YouTube" if is_youtube else "Spotify"
             await ctx.send(
-                "Untuk saat ini `!p` menerima **URL audio langsung** dari sumber yang mengizinkan streaming bot. "
-                "Judul lagu dan link halaman Spotify/YouTube belum bisa diputar langsung tanpa integrasi sumber audio resmi."
+                f"Link {platform} berhasil dikenali, tetapi halaman tersebut bukan URL stream audio. "
+                "Fumi tidak mengambil/ripping audio dari sana. Kirim judul lagu untuk mencari versi "
+                "yang tersedia di Jamendo, atau gunakan link audio langsung yang memang mengizinkan streaming bot."
             )
             return
+
+        # Link halaman track Jamendo dapat di-resolve melalui API resmi Jamendo.
+        jamendo_match = re.search(r"jamendo\.com/(?:[a-z]{2}/)?track/(\d+)", lowered)
+        if jamendo_match:
+            status = await ctx.send("🔎 Membuka track Jamendo...")
+            try:
+                track = await self.search_jamendo(query, track_id=jamendo_match.group(1))
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
+                await status.edit(content=f"❌ Gagal membuka track Jamendo: `{error}`")
+                return
+            if track is None:
+                await status.edit(content="Track Jamendo tidak ditemukan atau stream tidak tersedia.")
+                return
+            track.requester_id = ctx.author.id
+            try:
+                await status.delete()
+            except discord.HTTPException:
+                pass
+        elif self._is_direct_url(query):
+            track = Track(
+                url=query, title=self._safe_title(query), requester_id=ctx.author.id, webpage_url=query
+            )
+            await self.lookup_track_metadata(track)
+        else:
+            status = await ctx.send(f"🔎 Mencari **{discord.utils.escape_markdown(query)}** di katalog Jamendo...")
+            try:
+                track = await self.search_jamendo(query)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as error:
+                await status.edit(content=f"❌ Pencarian musik gagal: `{error}`")
+                return
+            if track is None:
+                await status.edit(
+                    content="Tidak menemukan lagu dengan stream yang tersedia. Coba judul atau nama artis lain."
+                )
+                return
+            track.requester_id = ctx.author.id
+            try:
+                await status.delete()
+            except discord.HTTPException:
+                pass
+
         voice = await self.connect_for_context(ctx)
         if voice is None:
             return
+
         player = self.get_player(ctx.guild.id)
-        track = Track(url=query, title=self._safe_title(query), requester_id=ctx.author.id, webpage_url=query)
-        await self.lookup_track_metadata(track)
+        player.text_channel_id = ctx.channel.id
         if voice.is_playing() or voice.is_paused() or player.current is not None:
             player.queue.append(track)
             await ctx.send(f"➕ **Ditambahkan ke antrean:** {discord.utils.escape_markdown(track.title)}")
             await self.refresh_player(ctx.guild.id)
         else:
             player.queue.append(track)
-            player.text_channel_id = ctx.channel.id
             await self.start_next(ctx.guild.id)
             await self.send_or_update_player(ctx)
 
@@ -458,8 +568,10 @@ class Music(commands.Cog):
         embed = discord.Embed(title="🎵 FUMI MUSIC — HELP", color=PLAYER_COLOR)
         embed.add_field(
             name="Pemutaran",
-            value=("`!p <URL audio>` — Putar audio\n`!queue` — Lihat antrean\n"
-                   "`!leave` — Keluar dari voice channel"),
+            value=("`!p <judul lagu>` — Cari dan putar dari Jamendo\n"
+                   "`!p <link track Jamendo>` — Putar track Jamendo\n"
+                   "`!p <URL audio langsung>` — Putar stream yang diizinkan\n"
+                   "`!queue` — Lihat antrean\n`!leave` — Keluar dari voice channel"),
             inline=False,
         )
         embed.add_field(
@@ -468,7 +580,12 @@ class Music(commands.Cog):
             inline=False,
         )
         embed.add_field(name="Antrean", value="`!shuffle` — Acak antrean", inline=False)
-        embed.set_footer(text="High Quality • Sumber audio harus mengizinkan streaming bot")
+        embed.add_field(
+            name="Link yang didukung",
+            value="Jamendo track URL dan URL audio langsung. Link halaman Spotify/YouTube hanya dikenali, bukan diputar langsung.",
+            inline=False,
+        )
+        embed.set_footer(text="High Quality • Jamendo + URL audio langsung yang diizinkan")
         await ctx.send(embed=embed)
 
     @commands.Cog.listener()
