@@ -524,12 +524,35 @@ class Music(commands.Cog):
                 pass
 
     def instrument_voice_sender(self, guild_id: int, voice: discord.VoiceClient) -> None:
-        """Count send_audio_packet calls without exposing stream URLs or secrets."""
+        """Count audio calls and the underlying UDP socket send attempts."""
         if getattr(voice, "_fumi_sender_instrumented", False):
             return
-        original_send = voice.send_audio_packet
-        stats: dict[str, int | str] = {"attempts": 0, "returned": 0, "errors": 0, "last_error": ""}
+
+        stats: dict[str, int | str] = {
+            "attempts": 0, "returned": 0, "errors": 0, "last_error": "",
+            "udp_attempts": 0, "udp_sent": 0, "udp_errors": 0, "last_udp_error": "",
+        }
         self.voice_send_stats[guild_id] = stats
+
+        # discord.py catches OSError from send_packet() and logs a dropped packet.
+        # Count the lower-level sendall too, or a dropped UDP packet can look successful.
+        connection = getattr(voice, "_connection", None)
+        original_packet_send = getattr(connection, "send_packet", None)
+        if connection is not None and callable(original_packet_send):
+            def counted_packet_send(packet: bytes):
+                stats["udp_attempts"] = int(stats["udp_attempts"]) + 1
+                try:
+                    result = original_packet_send(packet)
+                    stats["udp_sent"] = int(stats["udp_sent"]) + 1
+                    return result
+                except Exception as error:
+                    stats["udp_errors"] = int(stats["udp_errors"]) + 1
+                    stats["last_udp_error"] = f"{type(error).__name__}: {error}"[:250]
+                    raise
+
+            connection.send_packet = counted_packet_send
+
+        original_send = voice.send_audio_packet
 
         def counted_send(data: bytes, *, encode: bool = True) -> None:
             stats["attempts"] = int(stats["attempts"]) + 1
@@ -538,7 +561,7 @@ class Music(commands.Cog):
                 stats["returned"] = int(stats["returned"]) + 1
             except Exception as error:
                 stats["errors"] = int(stats["errors"]) + 1
-                stats["last_error"] = str(error)[:250]
+                stats["last_error"] = f"{type(error).__name__}: {error}"[:250]
                 raise
 
         voice.send_audio_packet = counted_send  # type: ignore[method-assign]
@@ -851,13 +874,37 @@ class Music(commands.Cog):
             davey_status = f"✅ davey {davey_version}"
         except importlib.metadata.PackageNotFoundError:
             davey_status = "❌ Paket davey tidak terpasang"
-        try:
-            has_dave = getattr(discord.voice_client, "has_dave", None)
-            dave_support = "Tersedia" if has_dave is True else ("Tidak tersedia" if has_dave is False else "Tidak dapat dipastikan")
-        except Exception:
-            dave_support = "Tidak dapat diperiksa"
+        connection_state = getattr(voice, "_connection", None) if voice is not None else None
+        if connection_state is not None:
+            protocol_version = getattr(connection_state, "dave_protocol_version", None)
+            dave_session = getattr(connection_state, "dave_session", None)
+            can_encrypt = getattr(connection_state, "can_encrypt", None)
+            downgraded = getattr(connection_state, "dave_downgraded", None)
+            mode = getattr(connection_state, "mode", None)
+            udp_socket = getattr(connection_state, "socket", None)
+            try:
+                udp_socket_open = bool(udp_socket and udp_socket.fileno() >= 0)
+            except Exception:
+                udp_socket_open = False
+            try:
+                privacy_session_active = bool(voice.voice_privacy_code)
+            except Exception:
+                privacy_session_active = False
+
+            dave_runtime = (
+                f"Protocol version: **{protocol_version if protocol_version is not None else 'unknown'}**\n"
+                f"Session object: **{'ada' if dave_session is not None else 'tidak ada'}**\n"
+                f"Can encrypt: **{can_encrypt if can_encrypt is not None else 'unknown'}**\n"
+                f"Privacy session aktif: **{privacy_session_active}**\n"
+                f"Downgraded: **{downgraded if downgraded is not None else 'unknown'}**\n"
+                f"Voice mode: `{mode if mode is not None else 'unknown'}`\n"
+                f"UDP socket terbuka: **{udp_socket_open}**"
+            )
+        else:
+            dave_runtime = "Voice connection state belum tersedia."
+
         embed.add_field(name="discord.py version", value=f"`{discord_version}`", inline=True)
-        embed.add_field(name="DAVE support", value=f"{davey_status}\nRuntime: **{dave_support}**", inline=True)
+        embed.add_field(name="DAVE / Voice runtime", value=f"{davey_status}\n{dave_runtime}", inline=False)
         if voice is not None:
             try:
                 latency_text = f"{voice.latency * 1000:.0f} ms"
@@ -868,12 +915,17 @@ class Music(commands.Cog):
         send_stats = self.voice_send_stats.get(ctx.guild.id)
         if send_stats is not None:
             send_text = (
-                f"Attempts: **{send_stats['attempts']:,}**\n"
-                f"Returned: **{send_stats['returned']:,}**\n"
-                f"Errors: **{send_stats['errors']:,}**"
+                f"Audio calls: **{send_stats['attempts']:,}**\n"
+                f"Audio calls returned: **{send_stats['returned']:,}**\n"
+                f"Audio call errors: **{send_stats['errors']:,}**\n"
+                f"UDP send attempts: **{send_stats.get('udp_attempts', 0):,}**\n"
+                f"UDP sendall success: **{send_stats.get('udp_sent', 0):,}**\n"
+                f"UDP send errors/drops: **{send_stats.get('udp_errors', 0):,}**"
             )
             if send_stats.get("last_error"):
-                send_text += f"\nLast error: `{str(send_stats['last_error'])[:180]}`"
+                send_text += f"\nLast audio error: `{str(send_stats['last_error'])[:150]}`"
+            if send_stats.get("last_udp_error"):
+                send_text += f"\nLast UDP error: `{str(send_stats['last_udp_error'])[:150]}`"
         else:
             send_text = "Belum terpasang; jalankan `!p` setelah update lalu cek lagi."
         embed.add_field(name="Discord audio send", value=send_text, inline=False)
