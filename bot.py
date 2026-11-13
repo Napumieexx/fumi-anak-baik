@@ -32,7 +32,13 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(
+class FumiBot(commands.Bot):
+    async def setup_hook(self):
+        # Muat fitur AFK Voice sebagai extension terpisah.
+        await self.load_extension("afk_voice")
+
+
+bot = FumiBot(
     command_prefix="!",
     intents=intents
 )
@@ -107,6 +113,7 @@ async def on_ready():
     print("Game system terdaftar.")
     print("Quiz system terdaftar.")
     print("RPG system terdaftar.")
+    print("AFK Voice extension aktif.")
 
     if LOG_CHANNEL_ID:
         print(f"Mod Log dikonfigurasi: {LOG_CHANNEL_ID}")
