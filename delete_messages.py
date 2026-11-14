@@ -11,7 +11,10 @@ class DeleteMessages(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="clear", aliases=["purge", "deletebulk"])
+    @commands.command(
+    name="bersihkan",
+    aliases=["purge", "deletebulk"])
+    
     @commands.guild_only()
     @commands.has_permissions(manage_messages=True)
     @commands.bot_has_permissions(manage_messages=True, read_message_history=True)
