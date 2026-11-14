@@ -83,10 +83,14 @@ intents.members = True
 
 class FumiBot(commands.Bot):
     async def setup_hook(self):
-        # Muat fitur AFK Voice sebagai extension terpisah.
+        # Muat fitur AFK Voice
         await self.load_extension("afk_voice")
+
+        # Muat fitur Music
         await self.load_extension("music")
 
+        # Muat fitur Delete Messages
+        await self.load_extension("delete_messages")
 
 bot = FumiBot(
     command_prefix="!",
