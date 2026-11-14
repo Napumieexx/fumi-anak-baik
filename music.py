@@ -246,7 +246,10 @@ class Music(commands.Cog):
         self.players: dict[int, GuildPlayer] = defaultdict(GuildPlayer)
         self.progress_task: asyncio.Task | None = None
         self.jamendo_client_id = os.getenv("JAMENDO_CLIENT_ID")
+        # Audius: API Key for app identification/rate limits; Bearer Token for
+        # authenticated server-side REST requests. Keep both in host env vars.
         self.audius_api_key = os.getenv("AUDIUS_API_KEY")
+        self.audius_bearer_token = os.getenv("AUDIUS_API_BEARER_TOKEN")
         self.spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         self._spotify_token: str | None = None
@@ -840,17 +843,29 @@ class Music(commands.Cog):
             return False
 
     async def search_audius(self, query: str) -> Track | None:
-        """Search public streamable Audius tracks using the official read-only API."""
+        """Search public Audius tracks via the v1 REST API.
+
+        Public read-only search can work without OAuth. The API key raises the
+        app's rate limit; the server-side Bearer Token is sent in the
+        Authorization header when configured. Only tracks with an explicit
+        Creative Commons/public-domain declaration are eligible for playback.
+        """
         timeout = aiohttp.ClientTimeout(total=14, connect=7, sock_read=8)
         params = {"query": query, "limit": 20}
         if self.audius_api_key:
             params["api_key"] = self.audius_api_key
+        headers = {}
+        if self.audius_bearer_token:
+            headers["Authorization"] = f"Bearer {self.audius_bearer_token}"
+
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(
                     "https://api.audius.co/v1/tracks/search", params=params
                 ) as response:
                     if response.status != 200:
+                        body = (await response.text())[:240]
+                        print(f"Fumi Audius search HTTP {response.status}: {body}")
                         return None
                     payload = await response.json(content_type=None)
 
@@ -866,37 +881,56 @@ class Music(commands.Cog):
                     continue
                 if item.get("isStreamGated") or item.get("is_stream_gated"):
                     continue
-                # A streamable flag is not a copyright license. Require an explicit
-                # CC/public-domain declaration before making it available to the bot.
-                license_value = item.get("license") or item.get("license_url") or item.get("licenseUrl")
+
+                # Streamability is not proof of reuse permission. Require a
+                # clear CC/public-domain marker before offering the track.
+                license_value = (
+                    item.get("license")
+                    or item.get("license_url")
+                    or item.get("licenseUrl")
+                )
                 if isinstance(license_value, dict):
-                    license_value = license_value.get("url") or license_value.get("name") or license_value.get("type")
+                    license_value = (
+                        license_value.get("url")
+                        or license_value.get("name")
+                        or license_value.get("type")
+                    )
                 license_text = str(license_value or "")
                 license_lower = license_text.casefold()
-                if not ("creativecommons.org/licenses/" in license_lower
-                        or "creativecommons.org/publicdomain/" in license_lower
-                        or "creative commons" in license_lower
-                        or "cc-by" in license_lower or "cc0" in license_lower
-                        or "public domain" in license_lower):
+                if not (
+                    "creativecommons.org/licenses/" in license_lower
+                    or "creativecommons.org/publicdomain/" in license_lower
+                    or "creative commons" in license_lower
+                    or "cc-by" in license_lower
+                    or "cc0" in license_lower
+                    or "public domain" in license_lower
+                ):
                     continue
+
                 score = self._match_score(query, title, artist)
                 if score >= 0.60:
-                    ranked.append((score, item))
+                    ranked.append((score, item, license_text))
 
             ranked.sort(key=lambda pair: pair[0], reverse=True)
-            for score, item in ranked[:5]:
+            from urllib.parse import urlencode
+            for score, item, license_text in ranked[:5]:
                 track_id = item.get("id")
                 if not track_id:
                     continue
+
+                # API key is suitable for public stream requests and rate-limit
+                # attribution. Do not put the private Bearer Token in the URL.
                 stream_url = f"https://api.audius.co/v1/tracks/{track_id}/stream"
                 if self.audius_api_key:
-                    from urllib.parse import urlencode
                     stream_url += "?" + urlencode({"api_key": self.audius_api_key})
 
                 artwork = item.get("artwork") or {}
                 duration_seconds = item.get("duration")
                 try:
-                    duration_seconds = int(float(duration_seconds)) if duration_seconds is not None else None
+                    duration_seconds = (
+                        int(float(duration_seconds))
+                        if duration_seconds is not None else None
+                    )
                 except (TypeError, ValueError):
                     duration_seconds = None
                 duration_text = (
@@ -910,15 +944,22 @@ class Music(commands.Cog):
                     webpage_url=item.get("permalink") or "https://audius.co",
                     duration=duration_text,
                     duration_seconds=duration_seconds,
-                    thumbnail=artwork.get("_480x480") or artwork.get("_1000x1000") or artwork.get("_150x150"),
-                    artist=str((item.get("user") or {}).get("name") or ""),
+                    thumbnail=(
+                        artwork.get("_480x480")
+                        or artwork.get("_1000x1000")
+                        or artwork.get("_150x150")
+                    ),
+                    artist=artist if (artist := str(
+                        (item.get("user") or {}).get("name")
+                        or (item.get("user") or {}).get("handle")
+                        or ""
+                    )) else None,
                     license_url=license_text if license_text.startswith("http") else None,
                     source="Audius",
                 )
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
             print(f"Fumi Audius search warning: {type(error).__name__}: {error}")
         return None
-
 
 
     async def search_multi_source(self, query: str) -> Track | None:
