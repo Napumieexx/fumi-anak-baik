@@ -246,10 +246,9 @@ class Music(commands.Cog):
         self.players: dict[int, GuildPlayer] = defaultdict(GuildPlayer)
         self.progress_task: asyncio.Task | None = None
         self.jamendo_client_id = os.getenv("JAMENDO_CLIENT_ID")
-        # Audius: API Key for app identification/rate limits; Bearer Token for
-        # authenticated server-side REST requests. Keep both in host env vars.
         self.audius_api_key = os.getenv("AUDIUS_API_KEY")
         self.audius_bearer_token = os.getenv("AUDIUS_API_BEARER_TOKEN")
+        self.last_search_diagnostics: dict[str, object] = {}
         self.spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         self._spotify_token: str | None = None
@@ -843,34 +842,48 @@ class Music(commands.Cog):
             return False
 
     async def search_audius(self, query: str) -> Track | None:
-        """Search public Audius tracks via the v1 REST API.
-
-        Public read-only search can work without OAuth. The API key raises the
-        app's rate limit; the server-side Bearer Token is sent in the
-        Authorization header when configured. Only tracks with an explicit
-        Creative Commons/public-domain declaration are eligible for playback.
-        """
+        """Search Audius read-only API and record safe diagnostics without logging credentials."""
         timeout = aiohttp.ClientTimeout(total=14, connect=7, sock_read=8)
         params = {"query": query, "limit": 20}
-        if self.audius_api_key:
-            params["api_key"] = self.audius_api_key
-        headers = {}
+        headers = {"Accept": "application/json"}
         if self.audius_bearer_token:
             headers["Authorization"] = f"Bearer {self.audius_bearer_token}"
+        # Audius read-only endpoints can work without credentials; API key raises limits.
+        if self.audius_api_key:
+            params["api_key"] = self.audius_api_key
 
+        diag = {
+            "status": "starting", "http": None, "results": 0,
+            "streamable": 0, "gated": 0, "license_rejected": 0,
+            "match_rejected": 0, "matched": 0, "stream_url_created": 0,
+            "error": None, "query": query[:100],
+        }
+        self.last_search_diagnostics["Audius"] = diag
+        print(f"[Fumi Audius] search start; query={query[:100]!r}; api_key={'yes' if self.audius_api_key else 'no'}; bearer={'yes' if self.audius_bearer_token else 'no'}")
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(
                     "https://api.audius.co/v1/tracks/search", params=params
                 ) as response:
+                    diag["http"] = response.status
                     if response.status != 200:
                         body = (await response.text())[:240]
-                        print(f"Fumi Audius search HTTP {response.status}: {body}")
+                        diag["status"] = "http_error"
+                        diag["error"] = f"HTTP {response.status}: {body}"
+                        print(f"[Fumi Audius] HTTP {response.status}; response={body!r}")
                         return None
                     payload = await response.json(content_type=None)
 
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                diag["status"] = "invalid_payload"
+                diag["error"] = "JSON response tidak memiliki data berupa list"
+                print("[Fumi Audius] invalid payload: missing data list")
+                return None
+
+            diag["results"] = len(data)
             ranked = []
-            for item in payload.get("data") or []:
+            for item in data:
                 if not isinstance(item, dict):
                     continue
                 user = item.get("user") or {}
@@ -879,63 +892,62 @@ class Music(commands.Cog):
                 streamable = item.get("isStreamable", item.get("is_streamable", True))
                 if streamable is False or str(streamable).lower() in {"false", "0", "no"}:
                     continue
+                diag["streamable"] += 1
                 if item.get("isStreamGated") or item.get("is_stream_gated"):
+                    diag["gated"] += 1
                     continue
 
-                # Streamability is not proof of reuse permission. Require a
-                # clear CC/public-domain marker before offering the track.
-                license_value = (
-                    item.get("license")
-                    or item.get("license_url")
-                    or item.get("licenseUrl")
-                )
+                # A public stream endpoint is not itself proof of reuse permission.
+                license_value = item.get("license") or item.get("license_url") or item.get("licenseUrl")
                 if isinstance(license_value, dict):
-                    license_value = (
-                        license_value.get("url")
-                        or license_value.get("name")
-                        or license_value.get("type")
-                    )
+                    license_value = license_value.get("url") or license_value.get("name") or license_value.get("type")
                 license_text = str(license_value or "")
                 license_lower = license_text.casefold()
-                if not (
+                permitted_license = (
                     "creativecommons.org/licenses/" in license_lower
                     or "creativecommons.org/publicdomain/" in license_lower
                     or "creative commons" in license_lower
-                    or "cc-by" in license_lower
-                    or "cc0" in license_lower
+                    or "cc-by" in license_lower or "cc0" in license_lower
                     or "public domain" in license_lower
-                ):
+                )
+                if not permitted_license:
+                    diag["license_rejected"] += 1
                     continue
 
                 score = self._match_score(query, title, artist)
-                if score >= 0.60:
-                    ranked.append((score, item, license_text))
+                if score < 0.60:
+                    diag["match_rejected"] += 1
+                    continue
+                diag["matched"] += 1
+                ranked.append((score, item, license_text))
 
             ranked.sort(key=lambda pair: pair[0], reverse=True)
-            from urllib.parse import urlencode
+            diag["stream_url_created"] = min(len(ranked), 5)
             for score, item, license_text in ranked[:5]:
                 track_id = item.get("id")
                 if not track_id:
                     continue
-
-                # API key is suitable for public stream requests and rate-limit
-                # attribution. Do not put the private Bearer Token in the URL.
                 stream_url = f"https://api.audius.co/v1/tracks/{track_id}/stream"
                 if self.audius_api_key:
+                    from urllib.parse import urlencode
                     stream_url += "?" + urlencode({"api_key": self.audius_api_key})
 
                 artwork = item.get("artwork") or {}
                 duration_seconds = item.get("duration")
                 try:
-                    duration_seconds = (
-                        int(float(duration_seconds))
-                        if duration_seconds is not None else None
-                    )
+                    duration_seconds = int(float(duration_seconds)) if duration_seconds is not None else None
                 except (TypeError, ValueError):
                     duration_seconds = None
                 duration_text = (
                     f"{duration_seconds // 60}:{duration_seconds % 60:02d}"
                     if duration_seconds else "Durasi tidak diketahui"
+                )
+                diag["status"] = "candidate_found"
+                print(
+                    f"[Fumi Audius] results={diag['results']}; streamable={diag['streamable']}; "
+                    f"gated={diag['gated']}; license_rejected={diag['license_rejected']}; "
+                    f"match_rejected={diag['match_rejected']}; matched={diag['matched']}; "
+                    f"selected={title!r}; score={score:.3f}"
                 )
                 return Track(
                     url=stream_url,
@@ -944,22 +956,25 @@ class Music(commands.Cog):
                     webpage_url=item.get("permalink") or "https://audius.co",
                     duration=duration_text,
                     duration_seconds=duration_seconds,
-                    thumbnail=(
-                        artwork.get("_480x480")
-                        or artwork.get("_1000x1000")
-                        or artwork.get("_150x150")
-                    ),
-                    artist=artist if (artist := str(
-                        (item.get("user") or {}).get("name")
-                        or (item.get("user") or {}).get("handle")
-                        or ""
-                    )) else None,
+                    thumbnail=artwork.get("_480x480") or artwork.get("_1000x1000") or artwork.get("_150x150"),
+                    artist=artist,
                     license_url=license_text if license_text.startswith("http") else None,
                     source="Audius",
                 )
+
+            diag["status"] = "no_eligible_match"
+            print(
+                f"[Fumi Audius] no eligible match; results={diag['results']}; "
+                f"streamable={diag['streamable']}; gated={diag['gated']}; "
+                f"license_rejected={diag['license_rejected']}; "
+                f"match_rejected={diag['match_rejected']}"
+            )
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
-            print(f"Fumi Audius search warning: {type(error).__name__}: {error}")
+            diag["status"] = "exception"
+            diag["error"] = f"{type(error).__name__}: {str(error)[:180]}"
+            print(f"[Fumi Audius] exception: {type(error).__name__}: {str(error)[:180]}")
         return None
+
 
 
     async def search_multi_source(self, query: str) -> Track | None:
@@ -996,10 +1011,12 @@ class Music(commands.Cog):
             for candidate in unique_queries
             for provider_name, method in providers
         ]
+        print(f"[Fumi Search] start; query={query[:100]!r}; variants={len(unique_queries)}; provider_calls={len(jobs)}")
         results = await asyncio.gather(*(job[2] for job in jobs), return_exceptions=True)
 
         ranked = []
         errors = []
+        provider_counts = {name: {"returned": 0, "validated": 0, "rejected_score": 0, "invalid_stream": 0} for name, _ in providers}
         for index, result in enumerate(results):
             provider_name, searched_query, _ = jobs[index]
             if isinstance(result, Exception):
@@ -1007,11 +1024,15 @@ class Music(commands.Cog):
                 continue
             if result is None:
                 continue
+            provider_counts[provider_name]["returned"] += 1
             score = self._match_score(query, result.title, result.artist)
             if score < 0.66:
+                provider_counts[provider_name]["rejected_score"] += 1
                 continue
             if not await self._validate_stream_url(result.url):
+                provider_counts[provider_name]["invalid_stream"] += 1
                 continue
+            provider_counts[provider_name]["validated"] += 1
             provider_bonus = {
                 "Jamendo": 0.012,
                 "Audius": 0.009,
@@ -1019,9 +1040,13 @@ class Music(commands.Cog):
             }.get(result.source, 0.0)
             ranked.append((score + provider_bonus, index, result))
 
-        if errors:
-            print("Fumi Maximum Search warnings: " + " | ".join(errors[:8]))
+        self.last_search_diagnostics["Maximum Search"] = {
+            "query": query[:100], "providers": provider_counts,
+            "errors": errors[:6], "selected": len(ranked),
+        }
+        print(f"[Fumi Search] provider_counts={provider_counts}; errors={errors[:6]!r}; validated_total={len(ranked)}")
         if not ranked:
+            print("[Fumi Search] no playable licensed candidates after provider search and stream validation")
             return None
         ranked.sort(key=lambda item: item[0], reverse=True)
         best_score, _, best_track = ranked[0]
@@ -1737,6 +1762,41 @@ class Music(commands.Cog):
         await ctx.guild.voice_client.disconnect()
         await ctx.send("👋 Fumi telah meninggalkan voice channel.")
 
+    @commands.command(name="musicdiag", aliases=["msearchdiag"])
+    @commands.guild_only()
+    async def music_search_diagnostics_command(self, ctx: commands.Context):
+        """Show latest provider search diagnostics without exposing credentials or URLs."""
+        data = self.last_search_diagnostics
+        if not data:
+            await ctx.send("Belum ada diagnostik pencarian. Jalankan `!p judul artis`, lalu `!musicdiag`.")
+            return
+        lines = []
+        audius = data.get("Audius")
+        if isinstance(audius, dict):
+            lines.append(
+                "**Audius**\n"
+                f"Status: `{audius.get('status')}` | HTTP: `{audius.get('http')}`\n"
+                f"Hasil: `{audius.get('results')}` | Streamable: `{audius.get('streamable')}`\n"
+                f"Gated: `{audius.get('gated')}` | Ditolak lisensi: `{audius.get('license_rejected')}`\n"
+                f"Tidak cocok: `{audius.get('match_rejected')}` | Cocok: `{audius.get('matched')}`\n"
+                f"Error: `{str(audius.get('error') or '-')[:180]}`"
+            )
+        maximum = data.get("Maximum Search")
+        if isinstance(maximum, dict):
+            lines.append(
+                f"**Multi-source**\nQuery: `{maximum.get('query')}` | "
+                f"Kandidat lolos validasi: `{maximum.get('selected')}`"
+            )
+            for provider, counts in (maximum.get("providers") or {}).items():
+                lines.append(
+                    f"{provider}: returned `{counts.get('returned')}`, validated `{counts.get('validated')}`, "
+                    f"score rejected `{counts.get('rejected_score')}`, invalid stream `{counts.get('invalid_stream')}`"
+                )
+            if maximum.get("errors"):
+                lines.append("Warnings: `" + " | ".join(maximum["errors"])[:500] + "`")
+        text = "\n\n".join(lines) or "Belum ada hasil diagnostik yang bisa ditampilkan."
+        await ctx.send(text[:1900])
+
     @commands.command(name="musicdebug", aliases=["mdebug"])
     async def music_debug_command(self, ctx: commands.Context):
         """Diagnostik musik yang hasilnya dikirim ke channel tempat command dipakai."""
@@ -2039,7 +2099,7 @@ class Music(commands.Cog):
                    "`!search <judul>` — Pilih dari beberapa hasil\n"
                    "`!p <link track Jamendo>` — Putar track Jamendo\n"
                    "`!p <URL audio langsung>` — Putar stream yang diizinkan\n"
-                   "`!queue` — Lihat antrean\n`!leave` — Keluar dari voice channel"),
+                   "`!queue` — Lihat antrean\n`!leave` — Keluar dari voice channel\n`!musicdiag` — Diagnostik pencarian"),
             inline=False,
         )
         embed.add_field(
